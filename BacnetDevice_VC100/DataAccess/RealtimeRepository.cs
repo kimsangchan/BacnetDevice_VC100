@@ -1,5 +1,6 @@
 ﻿// DataAccess/RealtimeRepository.cs
 using System;
+using System.Collections.Generic;
 using System.Configuration;
 using System.Data;
 using System.Data.SqlClient;
@@ -31,7 +32,6 @@ namespace BacnetDevice_VC100.DataAccess
                 throw;
             }
         }
-
         /// <summary>
         /// 실시간 값 Upsert.
         /// PRIMARY KEY(DEVICE_SEQ, SYSTEM_PT_ID) 같은 구조를 가정한다.
@@ -115,5 +115,93 @@ WHEN NOT MATCHED THEN
                 throw;
             }
         }
+        /// <summary>
+        /// TB_BACNET_REALTIME에서 특정 디바이스의 최신 스냅샷을 조회한다.
+        /// </summary>
+        public Dictionary<string, double> GetSnapshotByDevice(int deviceSeq)
+        {
+            var result = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+
+            const string sql = @"
+SELECT
+    SYSTEM_PT_ID,
+    VALUE,
+    QUALITY,
+    LAST_ERROR
+FROM TB_BACNET_REALTIME WITH (NOLOCK)
+WHERE DEVICE_SEQ = @deviceSeq;
+";
+
+            try
+            {
+                using (var conn = new SqlConnection(_connectionString))
+                using (var cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.Add("@deviceSeq", SqlDbType.Int).Value = deviceSeq;
+                    conn.Open();
+
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        int ordSysPtId = reader.GetOrdinal("SYSTEM_PT_ID");
+                        int ordValue = reader.GetOrdinal("VALUE");
+                        // QUALITY / LAST_ERROR 는 지금은 안 써도 됨
+
+                        while (reader.Read())
+                        {
+                            // 1) 포인트 ID
+                            if (reader.IsDBNull(ordSysPtId))
+                                continue;
+
+                            string ptId = reader.GetString(ordSysPtId).Trim();
+                            if (string.IsNullOrEmpty(ptId))
+                                continue;
+
+                            // 2) VALUE → 문자열로 안전하게 읽어서 double.TryParse
+                            double value = RealtimeConstants.FailValue;
+
+                            if (!reader.IsDBNull(ordValue))
+                            {
+                                object raw = reader.GetValue(ordValue);
+                                string s = Convert.ToString(raw, CultureInfo.InvariantCulture);
+
+                                double parsed;
+                                if (double.TryParse(
+                                        s,
+                                        NumberStyles.Float | NumberStyles.AllowThousands,
+                                        CultureInfo.InvariantCulture,
+                                        out parsed))
+                                {
+                                    value = parsed;
+                                }
+                            }
+
+                            // 마지막 값으로 덮어쓰기 (한 포인트당 1행 가정)
+                            result[ptId] = value;
+                        }
+                    }
+                }
+
+                return result;
+            }
+            catch (SqlException ex)
+            {
+                BacnetLogger.Error(
+                    string.Format(
+                        "GetSnapshotByDevice SQL 예외. device_seq={0}, msg={1}",
+                        deviceSeq, ex.Message),
+                    ex);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                BacnetLogger.Error(
+                    string.Format(
+                        "GetSnapshotByDevice 실패. device_seq={0}, msg={1}",
+                        deviceSeq, ex.Message),
+                    ex);
+                throw;
+            }
+        }
     }
 }
+
