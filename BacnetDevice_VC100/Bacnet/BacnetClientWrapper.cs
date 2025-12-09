@@ -1,6 +1,7 @@
 ﻿// Bacnet/BacnetClientWrapper.cs
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO.BACnet;
 
 namespace BacnetDevice_VC100.Bacnet
@@ -101,7 +102,80 @@ namespace BacnetDevice_VC100.Bacnet
                 return false;
             }
         }
+        /// <summary>
+        /// 특정 오브젝트의 PresentValue를 쓰기 (BV/AV/MSV 등 공통).
+        /// - AV/AI/AO 계열: Real 실수로 기록
+        /// - BV/BO/MSV/MSO 계열: Enumerated(정수)로 기록
+        /// </summary>
+        public bool TryWritePresentValue(
+            StationConfig station,
+            BacnetObjectTypes objectType,
+            uint instance,
+            object rawValue,
+            out string errorMessage,
+            int timeoutMs = 3000)
+        {
+            errorMessage = null;
 
+            if (!_started)
+            {
+                errorMessage = "CLIENT_NOT_STARTED";
+                Console.WriteLine("[BACNET][WARN] Client not started. Call Start() first.");
+                return false;
+            }
+
+            // JACE 주소 구성 (IP:Port)
+            var addr = new BacnetAddress(
+                BacnetAddressTypes.IP,
+                station.Ip + ":" + station.Port);
+
+            var objId = new BacnetObjectId(objectType, instance);
+
+            try
+            {
+                BacnetValue bacnetValue;
+
+                // BV/BO/MSV/MSO 계열은 Enumerated 로 처리
+                bool isEnumType =
+                    objectType == BacnetObjectTypes.OBJECT_BINARY_VALUE ||
+                    objectType == BacnetObjectTypes.OBJECT_BINARY_OUTPUT ||
+                    objectType == BacnetObjectTypes.OBJECT_MULTI_STATE_VALUE ||
+                    objectType == BacnetObjectTypes.OBJECT_MULTI_STATE_OUTPUT;
+
+                if (isEnumType)
+                {
+                    uint enumVal = Convert.ToUInt32(rawValue, CultureInfo.InvariantCulture);
+                    bacnetValue = new BacnetValue(BacnetApplicationTags.BACNET_APPLICATION_TAG_ENUMERATED, enumVal);
+
+                }
+                else
+                {
+                    // 나머지는 실수 Real 로
+                    double d = Convert.ToDouble(rawValue, CultureInfo.InvariantCulture);
+                    bacnetValue = new BacnetValue(BacnetApplicationTags.BACNET_APPLICATION_TAG_REAL, d);
+                }
+
+                IList<BacnetValue> values = new BacnetValue[] { bacnetValue };
+
+                _client.WritePropertyRequest(
+                    addr,
+                    objId,
+                    BacnetPropertyIds.PROP_PRESENT_VALUE,
+                    values);
+
+                Console.WriteLine(
+                    "[BACNET] Write success. ObjType={0}, Inst={1}, Value={2}",
+                    objectType, instance, rawValue);
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+                Console.WriteLine("[BACNET][ERROR] Exception while writing: " + ex.Message);
+                return false;
+            }
+        }
 
         public void Dispose()
         {
