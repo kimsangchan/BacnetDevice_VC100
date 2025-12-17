@@ -69,7 +69,8 @@ namespace BacnetDevice_VC100
             _client.Start();
 
             _pollingService = new PollingService(_objectRepo, _realtimeRepo, _client);
-
+            // ⭐ 여기 추가: 폴링 시작 (예: 5000ms)
+            _pollingService.Start(_station, _deviceSeq, 5000);
             _connected = true;
             ToConnectState(_deviceSeq, true);
 
@@ -84,6 +85,15 @@ namespace BacnetDevice_VC100
             _connected = false;
             ToConnectState(_deviceSeq, false);
 
+            // ⭐ 여기 추가: 폴링 정지
+            try
+            {
+                if (_pollingService != null) _pollingService.Stop();
+            }
+            catch (Exception ex)
+            {
+                BacnetLogger.Error("[POLL][ERROR] Stop on disconnect failed", ex);
+            }
             _client?.Dispose();
             _client = null;
 

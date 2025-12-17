@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 using BacnetDevice_VC100.Bacnet;
 using BacnetDevice_VC100.DataAccess;
 using BacnetDevice_VC100.Models;
@@ -23,13 +24,81 @@ namespace BacnetDevice_VC100.Service
         private readonly RealtimeRepository _realtimeRepo;
         private readonly BacnetClientWrapper _client;
 
+        private Timer _timer;
+        private volatile bool _isRunning;
+        private StationConfig _station;
+        private int _deviceSeq;
+        private int _intervalMs;
+
         public PollingService(ObjectRepository objectRepo, RealtimeRepository realtimeRepo, BacnetClientWrapper client)
         {
             _objectRepo = objectRepo;
             _realtimeRepo = realtimeRepo;
             _client = client;
         }
+        public void Start(StationConfig station, int deviceSeq, int intervalMs)
+        {
+            if (station == null) throw new ArgumentNullException("station");
+            if (intervalMs < 500) intervalMs = 500; // 너무 빡세게 돌리면 DB/네트워크 터짐 방지
 
+            _station = station;
+            _deviceSeq = deviceSeq;
+            _intervalMs = intervalMs;
+
+            BacnetLogger.SetCurrentDevice(deviceSeq);
+            BacnetLogger.Info(string.Format("[POLL] Start() called. device_seq={0}, intervalMs={1}", deviceSeq, intervalMs));
+
+            // 중복 시작 방지
+            Stop();
+
+            _timer = new Timer(Tick, null, dueTime: 0, period: intervalMs);
+        }
+
+        public void Stop()
+        {
+            try
+            {
+                var t = _timer;
+                _timer = null;
+                if (t != null)
+                {
+                    t.Dispose();
+                    BacnetLogger.SetCurrentDevice(_deviceSeq);
+                    BacnetLogger.Info(string.Format("[POLL] Stop() called. device_seq={0}", _deviceSeq));
+                }
+            }
+            catch (Exception ex)
+            {
+                BacnetLogger.SetCurrentDevice(_deviceSeq);
+                BacnetLogger.Error("[POLL][ERROR] Stop failed", ex);
+            }
+        }
+
+        private void Tick(object state)
+        {
+            // Timer는 겹쳐 실행될 수 있어서 가드
+            if (_isRunning) return;
+            _isRunning = true;
+
+            try
+            {
+                PollOnce(_station, _deviceSeq);
+            }
+            catch (Exception ex)
+            {
+                BacnetLogger.SetCurrentDevice(_deviceSeq);
+                BacnetLogger.Error("[POLL][ERROR] Tick unexpected", ex);
+            }
+            finally
+            {
+                _isRunning = false;
+            }
+        }
+
+        public void Dispose()
+        {
+            Stop();
+        }
         /// <summary>
         /// 특정 device_seq 에 대해 한 번 폴링 수행.
         /// - PV(ReadPresentValue)만 수행한다.
