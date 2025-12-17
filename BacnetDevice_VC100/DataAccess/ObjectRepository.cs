@@ -152,5 +152,71 @@ ORDER BY OBJ_COUNT ASC;
                     return BacnetObjectTypes.OBJECT_ANALOG_INPUT;
             }
         }
+        public BacnetPointInfo GetPointBySystemPtId(int deviceSeq, string systemPtId)
+        {
+            const string sql = @"
+SELECT TOP 1
+    SYSTEM_PT_ID,
+    OBJ_NAME,
+    OBJ_TYPE,
+    DEVICE_SEQ,
+    OBJ_COUNT
+FROM dbo.P_OBJECT WITH (NOLOCK)
+WHERE DEVICE_SEQ = @DEVICE_SEQ
+  AND SYSTEM_PT_ID = @SYSTEM_PT_ID;
+";
+
+            try
+            {
+                using (var conn = new SqlConnection(_connectionString))
+                using (var cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.Add("@DEVICE_SEQ", SqlDbType.Int).Value = deviceSeq;
+                    cmd.Parameters.Add("@SYSTEM_PT_ID", SqlDbType.NVarChar, 50).Value = (object)systemPtId ?? DBNull.Value;
+
+                    conn.Open();
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        if (!reader.Read())
+                            return null;
+
+                        string spid = reader["SYSTEM_PT_ID"] as string;
+                        string objName = reader["OBJ_NAME"] as string;
+                        int objTypeCode = Convert.ToInt32(reader["OBJ_TYPE"]);
+                        int devSeq = Convert.ToInt32(reader["DEVICE_SEQ"]);
+
+                        uint instance = 0;
+                        if (!string.IsNullOrEmpty(spid))
+                        {
+                            var parts = spid.Split('-');
+                            if (parts.Length >= 2)
+                            {
+                                uint parsed;
+                                if (uint.TryParse(parts[1], out parsed))
+                                    instance = parsed;
+                            }
+                        }
+
+                        return new BacnetPointInfo
+                        {
+                            SystemPtId = spid,
+                            ObjName = objName,
+                            ObjTypeCode = objTypeCode,
+                            Instance = instance,
+                            DeviceSeq = devSeq,
+                            BacnetType = ConvertObjType(objTypeCode)
+                        };
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                BacnetLogger.Error(
+                    string.Format("GetPointBySystemPtId 실패. device_seq={0}, pt={1}", deviceSeq, systemPtId),
+                    ex);
+                throw;
+            }
+        }
+
     }
 }

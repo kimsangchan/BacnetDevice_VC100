@@ -202,6 +202,46 @@ WHERE DEVICE_SEQ = @deviceSeq;
                 throw;
             }
         }
+        public double? GetCurrentValue(int deviceSeq, string systemPtId)
+        {
+            const string sql = @"
+SELECT TOP 1 VALUE
+FROM dbo.TB_BACNET_REALTIME WITH (NOLOCK)
+WHERE DEVICE_SEQ = @deviceSeq
+  AND SYSTEM_PT_ID = @pt;
+";
+
+            try
+            {
+                using (var conn = new SqlConnection(_connectionString))
+                using (var cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.Add("@deviceSeq", SqlDbType.Int).Value = deviceSeq;
+                    cmd.Parameters.Add("@pt", SqlDbType.NVarChar, 50).Value = (object)systemPtId ?? DBNull.Value;
+
+                    conn.Open();
+                    object raw = cmd.ExecuteScalar();
+                    if (raw == null || raw == DBNull.Value)
+                        return null;
+
+                    double parsed;
+                    var s = Convert.ToString(raw, CultureInfo.InvariantCulture);
+
+                    if (double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out parsed))
+                        return parsed;
+
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                BacnetLogger.Error(
+                    string.Format("GetCurrentValue 실패. device_seq={0}, pt={1}", deviceSeq, systemPtId),
+                    ex);
+                throw;
+            }
+        }
+
     }
 }
 
