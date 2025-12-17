@@ -1,17 +1,21 @@
 ﻿// Service/PollingService.cs
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using BacnetDevice_VC100.Bacnet;
 using BacnetDevice_VC100.DataAccess;
 using BacnetDevice_VC100.Models;
-using System;
-using System.Collections.Generic;
-using System.IO.BACnet;
+using BacnetDevice_VC100.Util;
 
 namespace BacnetDevice_VC100.Service
 {
     /// <summary>
-    /// 하나의 BACnet 장비(device_seq)에 대해 포인트들을 폴링해서 DB에 반영하는 서비스.
-    /// - 포인트별로 예외를 개별 처리해서, 일부 포인트 실패해도 전체 폴링은 계속 간다.
-    /// - DB에는 절대 NULL 값을 쓰지 않고, 실패는 FailValue(-9999) + Quality="BAD"로 저장한다.
+    /// 하나의 BACnet 장비(device_seq)에 대해 포인트들을 폴링해서 Realtime(DB)에 반영하는 서비스.
+    ///
+    /// [왜 이렇게 설계했나]
+    /// - 폴링은 "주기적으로 PV만 읽는다"에 집중한다. (메타/스냅샷/리빌드는 별도 기능)
+    /// - 포인트 단위 예외는 삼켜서 전체 폴링이 멈추지 않게 한다.
+    /// - DB에는 NULL을 절대 쓰지 않는다. 실패는 FailValue + Quality=BAD로 저장한다.
     /// </summary>
     public class PollingService
     {
@@ -19,10 +23,7 @@ namespace BacnetDevice_VC100.Service
         private readonly RealtimeRepository _realtimeRepo;
         private readonly BacnetClientWrapper _client;
 
-        public PollingService(
-            ObjectRepository objectRepo,
-            RealtimeRepository realtimeRepo,
-            BacnetClientWrapper client)
+        public PollingService(ObjectRepository objectRepo, RealtimeRepository realtimeRepo, BacnetClientWrapper client)
         {
             _objectRepo = objectRepo;
             _realtimeRepo = realtimeRepo;
@@ -31,27 +32,48 @@ namespace BacnetDevice_VC100.Service
 
         /// <summary>
         /// 특정 device_seq 에 대해 한 번 폴링 수행.
+        /// - PV(ReadPresentValue)만 수행한다.
+        /// - Snapshot/메타 데이터 호출은 절대 하지 않는다.
         /// </summary>
         public void PollOnce(StationConfig station, int deviceSeq)
         {
-            Console.WriteLine("=== PollOnce START: device_seq={0}, Station={1} ===",
-                deviceSeq, station.Id);
+            // 이 폴링 스레드 로그가 디바이스 폴더로 떨어지도록 컨텍스트 설정
+            BacnetLogger.SetCurrentDevice(deviceSeq);
 
             IList<BacnetPointInfo> points = _objectRepo.GetPointsByDeviceSeq(deviceSeq);
+            int total = points != null ? points.Count : 0;
+
+            var sw = Stopwatch.StartNew();
+
+            int okCount = 0;
+            int readFail = 0;
+            int convertFail = 0;
+            int unexpected = 0;
+            int upsertFail = 0;
+
+            BacnetLogger.Info(string.Format(
+                "[POLL] START device_seq={0}, station={1}, pointCount={2}",
+                deviceSeq, station != null ? station.Id : "(null)", total));
+
+            if (points == null || points.Count == 0)
+            {
+                BacnetLogger.Warn(string.Format("[POLL] points empty. device_seq={0}", deviceSeq));
+                return;
+            }
 
             foreach (var pt in points)
             {
-                // objId는 디버깅용으로만 쓸 수 있는데, 지금은 안 쓰고 있어서 제거
-                // var objId = new BacnetObjectId(pt.BacnetType, pt.Instance);
-
                 string lastError = null;
-                double valueToSave;
-                string quality;
+                double valueToSave = RealtimeConstants.FailValue;
+                string quality = RealtimeConstants.QualityBad;
 
                 try
                 {
-                    // ❗ Wrapper 시그니처: out object
-                    object raw;
+                    // =========================================================
+                    // 1) BACnet PV 읽기
+                    //    - Wrapper 시그니처: out object
+                    // =========================================================
+                    object raw = null;
 
                     bool ok = _client.TryReadPresentValue(
                         station,
@@ -61,48 +83,54 @@ namespace BacnetDevice_VC100.Service
 
                     if (!ok)
                     {
-                        // 라이브러리 레벨에서 false 반환 (Timeout, NAK 등)
+                        // 라이브러리 레벨에서 false 반환 (Timeout/NAK 등)
                         lastError = "READ_FAILED";
-                        valueToSave = RealtimeConstants.FailValue;
-                        quality = RealtimeConstants.QualityBad;
-
-                        Console.WriteLine("[POLL][WARN] Read failed: device_seq={0}, pt={1}, reason={2}",
-                            deviceSeq, pt.SystemPtId, lastError);
+                        readFail++;
                     }
                     else
                     {
-                        // 읽기 성공 → 실제 값으로 변환
+                        // =========================================================
+                        // 2) PV 값을 double로 변환
+                        //    - 서버/업로더/파서가 결국 숫자 기반이므로 double로 통일
+                        // =========================================================
                         double numeric;
                         if (!TryConvertToDouble(raw, out numeric))
                         {
                             lastError = "CONVERT_FAILED";
-                            valueToSave = RealtimeConstants.FailValue;
-                            quality = RealtimeConstants.QualityBad;
+                            convertFail++;
 
-                            Console.WriteLine("[POLL][WARN] Convert failed: device_seq={0}, pt={1}, rawType={2}",
-                                deviceSeq, pt.SystemPtId, raw != null ? raw.GetType().Name : "null");
+                            // 변환 실패는 디버깅 가치가 커서 샘플링 없이 WARN
+                            BacnetLogger.Warn(string.Format(
+                                "[POLL][WARN] Convert failed: device_seq={0}, pt={1}, rawType={2}, raw={3}",
+                                deviceSeq,
+                                pt.SystemPtId,
+                                raw != null ? raw.GetType().Name : "null",
+                                raw != null ? raw.ToString() : "null"));
                         }
                         else
                         {
                             valueToSave = numeric;
                             quality = RealtimeConstants.QualityGood;
-                            Console.WriteLine("[POLL][OK] {0} = {1}", pt.SystemPtId, numeric);
+                            okCount++;
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    // BacnetException 같은 구체 타입이 없으니 일단 최상위 Exception으로 처리
+                    // 포인트 단위로만 죽이고 전체 루프는 계속 감
                     lastError = "UNEXPECTED: " + ex.Message;
-                    valueToSave = RealtimeConstants.FailValue;
-                    quality = RealtimeConstants.QualityBad;
+                    unexpected++;
 
-                    Console.WriteLine("[POLL][ERROR] Unexpected 예외: device_seq={0}, pt={1}, msg={2}",
-                        deviceSeq, pt.SystemPtId, ex);
-                    // 포인트 단위로만 죽이고 전체 루프는 계속 감.
+                    BacnetLogger.Error(
+                        string.Format("[POLL][ERROR] Unexpected exception: device_seq={0}, pt={1}",
+                                      deviceSeq, pt != null ? pt.SystemPtId : "(null)"),
+                        ex);
                 }
 
-                // ★ 여기서 절대 NULL 안 들어감
+                // =========================================================
+                // 3) Realtime(DB) 반영
+                //    - 여기서 NULL 쓰면 서버 파서/클라이언트가 더 크게 망가짐
+                // =========================================================
                 try
                 {
                     _realtimeRepo.UpsertRealtime(
@@ -115,14 +143,19 @@ namespace BacnetDevice_VC100.Service
                 }
                 catch (Exception ex)
                 {
-                    // DB 에러도 포인트 단위로만 로그 찍고 다음 포인트 진행
-                    Console.WriteLine("[POLL][ERROR] UpsertRealtime 예외: device_seq={0}, pt={1}, msg={2}",
-                        deviceSeq, pt.SystemPtId, ex.Message);
+                    upsertFail++;
+                    BacnetLogger.Error(
+                        string.Format("[POLL][ERROR] UpsertRealtime failed: device_seq={0}, pt={1}",
+                                      deviceSeq, pt != null ? pt.SystemPtId : "(null)"),
+                        ex);
                 }
             }
 
-            Console.WriteLine("=== PollOnce END: device_seq={0}, Station={1} ===",
-                deviceSeq, station.Id);
+            sw.Stop();
+
+            BacnetLogger.Info(string.Format(
+                "[POLL] END device_seq={0}, total={1}, ok={2}, readFail={3}, convertFail={4}, unexpected={5}, upsertFail={6}, elapsedMs={7}",
+                deviceSeq, total, okCount, readFail, convertFail, unexpected, upsertFail, sw.ElapsedMilliseconds));
         }
 
         /// <summary>

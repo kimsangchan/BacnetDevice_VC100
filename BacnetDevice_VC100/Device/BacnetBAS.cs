@@ -7,12 +7,14 @@ using BacnetDevice_VC100.DataAccess;
 using BacnetDevice_VC100.Models;
 using BacnetDevice_VC100.Service;
 using BacnetDevice_VC100.Util;
-using CShapeDeviceAgent;              // CShapeDeviceBase
+using CShapeDeviceAgent;
 
 namespace BacnetDevice_VC100
 {
     /// <summary>
-    /// SmartDeviceAgent에서 사용하는 BACnet 디바이스 DLL 진입점.
+    /// BACnet Device DLL Entry
+    /// - Agent 기준 제어 / 읽기 프로토콜 완전 호환
+    /// - Polling → DB → Snapshot → ToReceive 흐름 보장
     /// </summary>
     public class BacnetBAS : CShapeDeviceBase
     {
@@ -22,9 +24,11 @@ namespace BacnetDevice_VC100
         private RealtimeRepository _realtimeRepo;
         private PollingService _pollingService;
 
-        private bool _connected;
+        private Dictionary<string, BacnetPointInfo> _pointMap;
         private int _deviceSeq;
-        private DateTime _lastPollUtc;
+        private bool _connected;
+
+        #region Device Lifecycle
 
         public override bool DeviceLoad()
         {
@@ -34,220 +38,201 @@ namespace BacnetDevice_VC100
 
         public override bool Init(int iDeviceID)
         {
-            try
-            {
-                BacnetLogger.Info(string.Format("Init 시작. DeviceID={0}", iDeviceID));
+            BacnetLogger.SetCurrentDevice(iDeviceID);
 
-                DeviceID = iDeviceID;
-                _deviceSeq = iDeviceID;
-                _lastPollUtc = DateTime.MinValue;
-
-                BacnetLogger.Info(string.Format("Init 완료. device_seq={0}", _deviceSeq));
-                return true;
-            }
-            catch (Exception ex)
-            {
-                BacnetLogger.Error("Init 예외 발생.", ex);
-                return false;
-            }
+            _deviceSeq = iDeviceID;
+            BacnetLogger.Info($"Init 완료. device_seq={_deviceSeq}");
+            BacnetLogger.Info("Init: 실제 제어 모드(정상 모드)로 동작합니다.");
+            return true;
         }
 
         public override bool Connect(string sIP, int iPort)
         {
-            BacnetLogger.Info(
-                string.Format("Connect 시작. IP={0}, Port={1}, DeviceID={2}", sIP, iPort, DeviceID));
+            BacnetLogger.SetCurrentDevice(_deviceSeq);
 
-            try
+            BacnetLogger.Info($"Connect 시작. IP={sIP}, Port={iPort}, DeviceID={_deviceSeq}");
+
+            _station = new StationConfig
             {
-                _station = new StationConfig
-                {
-                    Id = "BACnet_" + sIP.Replace('.', '_') + "_" + DeviceID,
-                    Ip = sIP,
-                    Port = iPort,
-                    DeviceId = (uint)DeviceID
-                };
+                Id = $"BACnet_{sIP.Replace('.', '_')}_{_deviceSeq}",
+                Ip = sIP,
+                Port = iPort,
+                DeviceId = (uint)_deviceSeq
+            };
 
-                _objectRepo = new ObjectRepository();
-                _realtimeRepo = new RealtimeRepository();
-                _client = new BacnetClientWrapper();
-                _client.Start();
+            _objectRepo = new ObjectRepository();
+            _realtimeRepo = new RealtimeRepository();
 
-                _pollingService = new PollingService(_objectRepo, _realtimeRepo, _client);
+            BuildPointCache();
 
-                _connected = true;
-                ToConnectState(DeviceID, true);
+            _client = new BacnetClientWrapper();
+            _client.Start();
 
-                BacnetLogger.Info("Connect 완료. StationId=" + _station.Id);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                _connected = false;
-                ToConnectState(DeviceID, false);
+            _pollingService = new PollingService(_objectRepo, _realtimeRepo, _client);
 
-                BacnetLogger.Error("Connect 예외 발생.", ex);
-                return false;
-            }
+            _connected = true;
+            ToConnectState(_deviceSeq, true);
+
+            BacnetLogger.Info($"Connect 완료. StationId={_station.Id}");
+            return true;
         }
 
         public override bool DisConnect()
         {
-            BacnetLogger.Info("DisConnect 호출됨. DeviceID=" + DeviceID);
+            BacnetLogger.Info("DisConnect 호출됨.");
 
-            try
-            {
-                _connected = false;
-                ToConnectState(DeviceID, false);
+            _connected = false;
+            ToConnectState(_deviceSeq, false);
 
-                if (_client != null)
-                {
-                    _client.Dispose();
-                    _client = null;
-                }
+            _client?.Dispose();
+            _client = null;
 
-                _pollingService = null;
-                _objectRepo = null;
-                _realtimeRepo = null;
-                _station = null;
-
-                BacnetLogger.Info("DisConnect 완료.");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                BacnetLogger.Error("DisConnect 예외 발생.", ex);
-                return false;
-            }
+            return true;
         }
 
-        public override bool TimeRecv()
-        {
-            try
-            {
-                if (!_connected || _pollingService == null || _station == null)
-                    return false;
+        #endregion
 
-                int intervalMs = 0;
-                try
-                {
-                    intervalMs = DeviceIF.iTimeinterval;
-                }
-                catch
-                {
-                    intervalMs = 0;
-                }
+        #region Agent → DLL 진입점
 
-                var nowUtc = DateTime.UtcNow;
-
-                if (intervalMs > 0)
-                {
-                    var elapsedMs = (nowUtc - _lastPollUtc).TotalMilliseconds;
-                    if (elapsedMs < intervalMs)
-                        return true;
-                }
-
-                BacnetLogger.Info(
-                    string.Format("TimeRecv → PollOnce 호출. device_seq={0}", _deviceSeq));
-
-                _pollingService.PollOnce(_station, _deviceSeq);
-
-                _lastPollUtc = nowUtc;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                BacnetLogger.Error("TimeRecv 예외 발생.", ex);
-                return false;
-            }
-        }
-
-        public override bool MainSocketConnect()
-        {
-            return _connected;
-        }
-
+        /// <summary>
+        /// DeviceAgent → DLL 데이터 전달 진입점
+        /// - 세미콜론 포함 → 제어
+        /// - 세미콜론 없음 → 읽기
+        /// </summary>
         public override int SendData(int sendType, string cData, int dataSize)
         {
-            try
+            BacnetLogger.SetCurrentDevice(_deviceSeq);
+
+            if (string.IsNullOrEmpty(cData))
             {
-                BacnetLogger.Info(
-                    string.Format("SendData 호출. sendType={0}, DataSize={1}, Data={2}", sendType, dataSize, cData));
-
-                if (string.IsNullOrEmpty(cData))
-                {
-                    BacnetLogger.Warn("SendData: 수신 데이터가 비어 있습니다.");
-                    return 0;
-                }
-
-                // 1) 서버에서 요청한 포인트 리스트 파싱 (예: "BI-41,BI-40,AI-0,...")
-                string[] tokens = cData.Split(new char[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
-                var requested = new List<string>();
-
-                foreach (string raw in tokens)
-                {
-                    string pt = raw.Trim();
-                    if (pt.Length == 0)
-                        continue;
-
-                    // 형식 검사는 느슨하게, BI-41 / AI-0 / AO-3 ... 모두 허용
-                    requested.Add(pt);
-                }
-
-                if (requested.Count == 0)
-                {
-                    BacnetLogger.Warn("SendData: 파싱된 포인트가 없습니다. cData=" + cData);
-                    return 0;
-                }
-
-                // 2) DB에서 현 시점 스냅샷 가져오기
-                var rtRepo = new RealtimeRepository();
-                var snapshot = rtRepo.GetSnapshotByDevice(_deviceSeq); // _deviceSeq는 Init/Connect 때 저장해둔 값
-
-                // 3) 응답 문자열 구성: "ID,VALUE,0;" 형태
-                //    기존 BAS DLL 포맷과 동일 (예: "AI-0,23.4,0;BI-1,0,0;...")
-                var sb = new StringBuilder();
-                int count = 0;
-
-                foreach (string pt in requested)
-                {
-                    double value;
-
-                    if (!snapshot.TryGetValue(pt, out value))
-                    {
-                        // 실시간 테이블에 값이 없으면 FailValue로 리턴
-                        value = RealtimeConstants.FailValue;
-                    }
-
-                    sb.AppendFormat(
-                        CultureInfo.InvariantCulture,
-                        "{0},{1},0;",
-                        pt,
-                        value
-                    );
-
-                    count++;
-                }
-
-                string response = sb.ToString();
-
-                BacnetLogger.Info(
-                    string.Format("SendData: ToReceive 호출. deviceSeq={0}, pointCount={1}, Response={2}",
-                                  _deviceSeq, count, response));
-
-                // 4) AGENT(메인 프로그램) 쪽으로 응답 푸시
-                //  - iRecvType은 일단 sendType 그대로 전달 (MainForm/ServerPacketAgent에서는 타입은 안 씀)
-                //  - iObjCount에는 포인트 개수
-                ToReceive(_deviceSeq, sendType, response, count);
-
-                return count;
+                BacnetLogger.Warn("SendData: 수신 데이터 비어있음");
+                return 0;
             }
-            catch (Exception ex)
-            {
-                BacnetLogger.Error("SendData 처리 중 예외 발생.", ex);
-                return -1;
-            }
+
+            bool isControl = cData.IndexOf(';') >= 0;
+
+            return isControl
+                ? HandleControl(cData)
+                : HandleRead(sendType, cData);
         }
 
+        #endregion
 
+        #region Read / Control
+
+        /// <summary>
+        /// 제어 처리
+        /// 포맷: "AV-1,23.5;BV-3,1;"
+        /// </summary>
+        private int HandleControl(string cData)
+        {
+            int success = 0;
+            string[] items = cData.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (string item in items)
+            {
+                string[] parts = item.Split(',');
+                if (parts.Length < 2) continue;
+
+                string ptId = parts[0].Trim();
+                if (!double.TryParse(parts[1], NumberStyles.Any, CultureInfo.InvariantCulture, out double value))
+                    continue;
+
+                if (ptId.StartsWith("BV-", StringComparison.OrdinalIgnoreCase))
+                    value = value >= 1 ? 1 : 0;
+
+                if (TryControlPoint(ptId, value))
+                    success++;
+            }
+
+            BacnetLogger.Info($"SendData(Control): 성공={success}");
+            return success;
+        }
+
+        /// <summary>
+        /// 읽기 처리
+        /// 요청: "BI-1,AO-2,"
+        /// 응답: "BI-1,1,0;AO-2,23.5,0;"
+        /// </summary>
+        private int HandleRead(int sendType, string cData)
+        {
+            var snapshot = _realtimeRepo.GetSnapshotByDevice(_deviceSeq);
+            var sb = new StringBuilder();
+
+            string[] tokens = cData.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            int count = 0;
+
+            foreach (string pt in tokens)
+            {
+                double value = snapshot.TryGetValue(pt, out double v)
+                    ? v
+                    : RealtimeConstants.FailValue;
+
+                sb.AppendFormat(
+                    CultureInfo.InvariantCulture,
+                    "{0},{1},0;",
+                    pt,
+                    value
+                );
+                count++;
+            }
+
+            string response = sb.ToString();
+
+            BacnetLogger.Info($"[READ][ToReceive] count={count}, data={response}");
+
+            ToReceive(
+                _deviceSeq,
+                sendType,
+                response,
+                count
+            );
+
+            return count;
+        }
+
+        #endregion
+
+        #region Helpers
+
+        private void BuildPointCache()
+        {
+            _pointMap = new Dictionary<string, BacnetPointInfo>(StringComparer.OrdinalIgnoreCase);
+            foreach (var p in _objectRepo.GetPointsByDeviceSeq(_deviceSeq))
+            {
+                if (!string.IsNullOrEmpty(p.SystemPtId))
+                    _pointMap[p.SystemPtId] = p;
+            }
+
+            BacnetLogger.Info($"BuildPointCache 완료. count={_pointMap.Count}");
+        }
+
+        private bool TryControlPoint(string systemPtId, double value)
+        {
+            if (!_pointMap.TryGetValue(systemPtId, out var pt))
+                return false;
+
+            bool ok = _client.TryWritePresentValue(
+                _station,
+                pt.BacnetType,
+                pt.Instance,
+                value,
+                out string error);
+
+            if (!ok)
+                BacnetLogger.Warn($"제어 실패: {systemPtId}, error={error}");
+            else
+                _realtimeRepo.UpsertRealtime(
+                    _deviceSeq,
+                    systemPtId,
+                    value,
+                    RealtimeConstants.QualityGood,
+                    DateTime.Now,
+                    null);
+
+            return ok;
+        }
+
+        #endregion
     }
 }
