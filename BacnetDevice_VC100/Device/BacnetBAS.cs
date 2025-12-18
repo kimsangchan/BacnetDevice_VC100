@@ -1,404 +1,611 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Globalization;
-using System.IO.BACnet;
+using System.Linq;
 using System.Text;
-using BacnetDevice_VC100.Bacnet;
-using BacnetDevice_VC100.DataAccess;
-using BacnetDevice_VC100.Models;
-using BacnetDevice_VC100.Service;
-using BacnetDevice_VC100.Util;
+using System.Threading;
+using System.IO.BACnet;
 using CShapeDeviceAgent;
+using BacnetDevice_VC100.Util;
+using BacnetDevice_VC100.Protocol;
+using BacnetDevice_VC100.Model;
+using BacnetDevice_VC100.Data;
 
 namespace BacnetDevice_VC100
 {
     /// <summary>
-    /// BACnet Device DLL Entry
-    /// - Agent 기준 제어 / 읽기 프로토콜 완전 호환
-    /// - Polling → DB → Snapshot → ToReceive 흐름 보장
+    /// BACnet 장비 통신 DLL
+    /// 
+    /// [데이터 흐름]
+    /// 1. Init() → DB에서 포인트 로딩, BACnet 연결, 폴링 스레드 시작
+    /// 2. PollingLoop() → 독립 스레드에서 주기적 폴링 (RecvTimeCheck 무관)
+    /// 3. ReadMultiple() → BACnet 장비에서 데이터 읽기
+    /// 4. ToReceive() → Agent로 데이터 전송
+    /// 5. SendData() → Agent에서 제어 명령 수신
+    /// 6. WriteValue() → BACnet 장비로 제어 전송
+    /// 
+    /// [폴링 방식]
+    /// - 자체 스레드 방식 (기존 BAS.cs 방식과 동일)
+    /// - RecvTimeCheck=false 권장 (MainForm 타이머 사용 안 함)
+    /// - TimeInterval 주기로 자동 폴링
     /// </summary>
     public class BacnetBAS : CShapeDeviceBase
     {
-        private StationConfig _station;
-        private BacnetClientWrapper _client;
-        private ObjectRepository _objectRepo;
-        private RealtimeRepository _realtimeRepo;
-        private PollingService _pollingService;
-        private ControlHistoryRepository _controlHistoryRepo;
+        #region 필드
 
-        private Dictionary<string, BacnetPointInfo> _pointMap;
+        private BacnetLogger _logger;
+        private IBacnetClient _client;
         private int _deviceSeq;
-        private bool _connected;
+        private int _pollingInterval;  // 폴링 주기 (초) - Config.XML에서 로드
+        private List<BacnetPoint> _points = new List<BacnetPoint>();
+        private bool _isInitialized = false;
 
-        #region Device Lifecycle
+        // 자체 폴링 스레드
+        private Thread _pollingThread;
+        private volatile bool _isRunning = false;
 
-        public override bool DeviceLoad()
+        #endregion
+
+        #region 생성자
+
+        /// <summary>
+        /// 생성자
+        /// 
+        /// [주의]
+        /// - deviceSeq를 모르므로 Logger 생성 불가
+        /// - Init()에서 Logger 생성
+        /// </summary>
+        public BacnetBAS()
         {
-            BacnetLogger.Info("DeviceLoad 호출됨.");
-            return true;
+            // 아무것도 안 함 (Init에서 초기화)
         }
 
-        public override bool Init(int iDeviceID)
+        #endregion
+
+        #region 초기화
+
+        /// <summary>
+        /// DLL 초기화
+        /// 
+        /// [호출 경로]
+        /// MainForm.XMLLoad() → DeviceAgent.Init() → BacnetBAS.Init()
+        /// 
+        /// [처리 순서]
+        /// 1. Logger 생성 (deviceSeq 필요)
+        /// 2. Config.XML에서 폴링 주기 읽기
+        /// 3. BACnet 연결 (IP:Port)
+        /// 4. DB에서 포인트 목록 로딩 (P_OBJECT 테이블)
+        /// 5. 자체 폴링 스레드 시작 (RecvTimeCheck 무관)
+        /// </summary>
+        public override bool Init(int deviceSeq)
         {
-            BacnetLogger.SetCurrentDevice(iDeviceID);
+            _deviceSeq = deviceSeq;
 
-            _deviceSeq = iDeviceID;
-            BacnetLogger.Info($"Init 완료. device_seq={_deviceSeq}");
-            BacnetLogger.Info("Init: 실제 제어 모드(정상 모드)로 동작합니다.");
-            return true;
-        }
+            // ===== 1. Logger 생성 (여기서 처음 생성) =====
+            _logger = new BacnetLogger(_deviceSeq, LogLevel.ERROR);
 
-        public override bool Connect(string sIP, int iPort)
-        {
-            BacnetLogger.SetCurrentDevice(_deviceSeq);
-
-            BacnetLogger.Info($"Connect 시작. IP={sIP}, Port={iPort}, DeviceID={_deviceSeq}");
-
-            _station = new StationConfig
-            {
-                Id = $"BACnet_{sIP.Replace('.', '_')}_{_deviceSeq}",
-                Ip = sIP,
-                Port = iPort,
-                DeviceId = (uint)_deviceSeq
-            };
-
-            _objectRepo = new ObjectRepository();
-            _realtimeRepo = new RealtimeRepository();
-            _controlHistoryRepo = new ControlHistoryRepository();
-
-            BuildPointCache();
-
-            _client = new BacnetClientWrapper();
-            _client.Start();
-
-            _pollingService = new PollingService(_objectRepo, _realtimeRepo, _client);
-            // ⭐ 여기 추가: 폴링 시작 (예: 5000ms)
-            _pollingService.Start(_station, _deviceSeq, 5000);
-            _connected = true;
-            ToConnectState(_deviceSeq, true);
-
-            BacnetLogger.Info($"Connect 완료. StationId={_station.Id}");
-            return true;
-        }
-
-        public override bool DisConnect()
-        {
-            BacnetLogger.Info("DisConnect 호출됨.");
-
-            _connected = false;
-            ToConnectState(_deviceSeq, false);
-
-            // ⭐ 여기 추가: 폴링 정지
             try
             {
-                if (_pollingService != null) _pollingService.Stop();
+                _logger.Info($"=== BacnetBAS 초기화 시작 ===");                
+                _logger.Info($"DeviceSeq: {_deviceSeq}");
+
+                // ===== 2. Config.XML에서 폴링 주기 읽기 =====
+                if (base.DeviceIF.iTimeinterval > 0)
+                {
+                    // TimeInterval은 밀리초 단위 (예: 30000ms → 30초)
+                    int intervalMs = base.DeviceIF.iTimeinterval;
+                    _pollingInterval = intervalMs / 1000;  // 초 단위로 변환
+
+                    _logger.Info($"폴링 주기: {intervalMs}ms ({_pollingInterval}초)");
+                }
+                else
+                {
+                    // Config에 없으면 기본값 30초 사용
+                    _pollingInterval = 30;
+                    _logger.Warning($"TimeInterval 설정 없음, 기본값 사용: {_pollingInterval}초");
+                }
+
+                // ===== 3. BACnet 연결 =====
+                // DeviceIF에서 IP:Port 정보 가져오기
+                string ip = base.DeviceIF.sSystemIP;
+                int port = base.DeviceIF.iSystemPort;
+
+                if (string.IsNullOrEmpty(ip))
+                {
+                    _logger.Error("IP 주소가 없습니다");
+                    return false;
+                }
+
+                if (port <= 0)
+                {
+                    port = 47808;  // BACnet 기본 포트
+                    _logger.Warning($"포트 설정 없음, 기본값 사용: {port}");
+                }
+
+                _logger.Info($"연결 정보: {ip}:{port}");
+
+                // BACnet 클라이언트 생성
+                _client = new BacnetClientWrapper(_logger);
+
+                // 연결 시도
+                bool connected = _client.Connect(ip, port);
+                if (!connected)
+                {
+                    _logger.Error($"BACnet 연결 실패: {ip}:{port}");
+                    return false;
+                }
+
+                _logger.Info($"BACnet 연결 성공: {ip}:{port}");
+
+                // ===== 4. DB에서 포인트 로딩 =====
+                LoadPointsFromDatabase();
+
+                // ===== 5. 자체 폴링 스레드 시작 =====
+                // RecvTimeCheck 설정과 무관하게 독립적으로 동작
+                _isRunning = true;
+                _pollingThread = new Thread(PollingLoop);
+                _pollingThread.IsBackground = true;  // 메인 종료 시 자동 종료
+                _pollingThread.Name = $"BACnet_Poll_{_deviceSeq}";  // 디버깅용 이름
+                _pollingThread.Start();
+
+                _logger.Info($"폴링 스레드 시작: {_pollingInterval}초 주기");
+
+                _isInitialized = true;
+                _logger.Info("=== BacnetBAS 초기화 완료 ===");
+                // ===== 이 줄만 추가! =====
+                ToConnectState(_deviceSeq, true);  // MainForm에 연결 상태 알림
+                return true;
             }
             catch (Exception ex)
             {
-                BacnetLogger.Error("[POLL][ERROR] Stop on disconnect failed", ex);
+                if (_logger != null)
+                {
+                    _logger.Error("초기화 실패", ex);
+                }
+                return false;
             }
-            _client?.Dispose();
-            _client = null;
+        }
 
+
+        /// <summary>
+        /// DB에서 포인트 설정 로딩
+        /// 
+        /// [데이터 흐름]
+        /// P_OBJECT 테이블 (DEVICE_SEQ, SYSTEM_PT_ID, OBJ_TYPE, OBJ_INST)
+        ///   ↓
+        /// DeviceConfigService.LoadPoints()
+        ///   ↓
+        /// List<BacnetPoint> (SystemPtId, ObjectType, ObjectInstance)
+        ///   ↓
+        /// _points 필드에 저장 (폴링 시 사용)
+        /// </summary>
+        private void LoadPointsFromDatabase()
+        {
+            try
+            {
+                _logger.Info("포인트 설정 로딩 중...");
+
+                var configService = new DeviceConfigService(_deviceSeq, _logger);
+                _points = configService.LoadPoints();
+
+                if (_points.Count > 0)
+                {
+                    _logger.Info($"포인트 로딩 완료: {_points.Count}개");
+
+                    // 처음 3개 샘플 출력
+                    for (int i = 0; i < Math.Min(3, _points.Count); i++)
+                    {
+                        var p = _points[i];
+                        _logger.Info($"  [{i + 1}] {p.SystemPtId} ({p.ObjectType}-{p.ObjectInstance})");
+                    }
+                }
+                else
+                {
+                    _logger.Warning("포인트가 없습니다");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("포인트 로딩 에러", ex);
+                _points = new List<BacnetPoint>();
+            }
+        }
+
+        #endregion
+
+        #region 폴링 (자체 스레드)
+
+        /// <summary>
+        /// 자체 폴링 스레드 루프
+        /// 
+        /// [동작 방식]
+        /// - RecvTimeCheck 설정과 무관하게 독립적으로 동작
+        /// - TimeInterval 주기로 자동 폴링
+        /// - MainForm 타이머 사용 안 함 (TimeRecv 호출 안 됨)
+        /// 
+        /// [데이터 흐름]
+        /// while(_isRunning)
+        ///   ↓ Sleep(폴링 주기)
+        ///   ↓ BACnet ReadMultiple (_points 전체)
+        ///   ↓ Dictionary<PointId, Value?> 결과
+        ///   ↓ BuildResponseData() → "AV-101,25.50,0;..."
+        ///   ↓ ToReceive() → Agent로 전송
+        /// </summary>
+        private void PollingLoop()
+        {
+            _logger.Info("폴링 루프 진입 (독립 스레드)");
+
+            while (_isRunning)
+            {
+                try
+                {
+                    if (_points == null || _points.Count == 0)
+                    {
+                        _logger.Warning("폴링 대기 (포인트 없음)");
+                        Thread.Sleep(_pollingInterval);
+                        continue;
+                    }
+
+                    // ===== 1. 데이터 읽기 =====
+                    var results = _client.ReadMultiple(_points);
+
+                    if (results != null && results.Count > 0)
+                    {
+                        int successCount = results.Values.Count(v => v.HasValue);
+
+                        _logger.Info($"다중 읽기 완료: {successCount}/{_points.Count} 성공");
+
+                        // ===== 2. 데이터 포맷 =====
+                        string data = FormatDataForAgent(results);
+
+                        _logger.Info($"Agent 전송 데이터 (앞 100자): {data.Substring(0, Math.Min(100, data.Length))}...");
+
+                        // ===== 3. Agent로 전송 =====
+                        ToReceive(_deviceSeq, 1, data, results.Count);
+
+                        _logger.Info($"✅ Agent 전송 완료: DeviceSeq={_deviceSeq}, Count={results.Count}");
+                    }
+                    else
+                    {
+                        _logger.Warning("폴링 결과 없음");
+                    }
+
+                    Thread.Sleep(_pollingInterval);
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("폴링 에러", ex);
+                    Thread.Sleep(_pollingInterval);
+                }
+            }
+
+            _logger.Info("폴링 스레드 종료");
+        }
+
+        /// <summary>
+        /// Agent로 전송할 데이터 포맷 생성
+        /// 
+        /// [데이터 흐름]
+        /// results = { "AO-1": 0, "AO-2": 0, "BI-0": 1, ... }
+        ///   ↓
+        /// foreach (point in _points)
+        ///   ↓ results에서 값 찾기
+        ///   ↓ AO-1 → 0 (HasValue)
+        ///     ↓ "AO-1,0,0|"
+        ///   ↓ AO-2 → 0 (HasValue)
+        ///     ↓ "AO-1,0,0|AO-2,0,0|"
+        ///   ↓ BI-0 → null (없음)
+        ///     ↓ "AO-1,0,0|AO-2,0,0|BI-0,0.0,1|"
+        ///   ↓
+        /// return "AO-1,0,0|AO-2,0,0|BI-0,0.0,1|..."
+        /// 
+        /// [포맷]
+        /// SystemPtId,Value,ErrorFlag|SystemPtId,Value,ErrorFlag|...
+        /// - ErrorFlag: 0 = 성공, 1 = 실패
+        /// </summary>
+        private string FormatDataForAgent(Dictionary<string, float?> results)
+        {
+            var sb = new StringBuilder();
+
+            foreach (var point in _points)
+            {
+                if (results.TryGetValue(point.SystemPtId, out float? value))
+                {
+                    if (value.HasValue)
+                    {
+                        // 성공: 실제 값, 에러플래그 0
+                        sb.Append($"{point.SystemPtId},{value.Value},0|");
+                    }
+                    else
+                    {
+                        // 실패: FailValue, 에러플래그 1
+                        sb.Append($"{point.SystemPtId},{point.FailValue},1|");
+                    }
+                }
+                else
+                {
+                    // 결과 없음: FailValue, 에러플래그 1
+                    sb.Append($"{point.SystemPtId},{point.FailValue},1|");
+                }
+            }
+
+            // 마지막 "|" 제거
+            string result = sb.ToString().TrimEnd('|');
+
+            return result;
+        }
+
+        /// <summary>
+        /// BACnet Read 결과를 ToReceive 포맷으로 변환
+        /// 
+        /// [입력]
+        /// Dictionary<string, float?> results
+        ///   - Key: SystemPtId (예: "AV-101")
+        ///   - Value: 읽은 값 (예: 25.5) 또는 null (실패)
+        /// 
+        /// [출력]
+        /// "PointId,Value,Quality;"
+        ///   - Quality=0: GOOD (정상)
+        ///   - Quality=1: BAD (실패, FailValue 사용)
+        /// 
+        /// [예시]
+        /// "AV-101,25.50,0;AV-102,30.00,0;BI-39,1.00,0;"
+        /// </summary>
+        private string BuildResponseData(Dictionary<string, float?> results)
+        {
+            var sb = new StringBuilder();
+
+            foreach (var kvp in results)
+            {
+                string pointId = kvp.Key;
+                float? value = kvp.Value;
+
+                if (value.HasValue)
+                {
+                    // 정상 값
+                    sb.AppendFormat("{0},{1:F2},0;", pointId, value.Value);
+                }
+                else
+                {
+                    // 읽기 실패 → FailValue 사용
+                    var point = _points.FirstOrDefault(p => p.SystemPtId == pointId);
+                    float failValue = point?.FailValue ?? 0.0f;
+
+                    sb.AppendFormat("{0},{1:F2},1;", pointId, failValue);
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// MainForm에서 호출하는 타이머 (사용 안 함)
+        /// 
+        /// [동작]
+        /// - RecvTimeCheck=false 면 호출 안 됨
+        /// - RecvTimeCheck=true 여도 자체 스레드가 폴링 수행
+        /// - 중복 방지를 위해 비활성
+        /// </summary>
+        public override bool TimeRecv()
+        {
+            // 자체 폴링 스레드 방식에서는 사용 안 함
             return true;
         }
 
         #endregion
 
-        #region Agent → DLL 진입점
+        #region 제어 (Write)
 
         /// <summary>
-        /// DeviceAgent → DeviceDLL 진입점.
-        ///
-        /// ✅ 핵심: Agent가 DLL로 던지는 문자열(cData)의 형태로 "Read/Control"을 구분한다.
-        ///
-        /// 1) Read(값 수집/폴링) 계열:
-        ///    - cData에 ';'가 없다.
-        ///    - 예) "READ" / "POLL" 같은 단일 토큰이 오거나,
-        ///         또는 sendType으로 구분되는 구조일 수 있다(프로젝트마다 다름).
-        ///    - 이 케이스는 HandleRead(sendType, cData)로 전달된다.
-        ///
-        /// 2) Control(제어) 계열:
-        ///    - cData에 ';'가 포함된다. (멀티포인트 제어를 ';'로 붙여서 한 번에 보냄)
-        ///    - 예) "AV-1,42;BV-3,1;"  ← 포인트 2개 제어
-        ///         - ';' 기준으로 명령 단위 분해
-        ///         - 각 명령은 "SYSTEM_PT_ID,NewValue(,옵션...)" 형태인 경우가 많음
-        ///
-        /// 🔁 우리가 구현할 제어 히스토리:
-        /// - 제어 명령 1개(포인트 1개) 처리할 때마다
-        ///   TB_BACNET_CONTROL_HISTORY에 1행 INSERT.
-        /// - PrevValue는 BACnet 재조회 없이,
-        ///   TB_BACNET_REALTIME에서 조회(GetCurrentValue)로 가져온다.
-        ///
-        /// ⚠ 주의:
-        /// - Server/Agent는 수정 불가. DLL 안에서만 "깨지지 않게" 처리해야 함.
-        /// - 그래서 파싱 실패/쓰기 실패도 반드시 히스토리에 남겨서 추적 가능하게 한다.
+        /// Agent로부터 제어 명령 수신
+        /// 
+        /// [호출 경로]
+        /// Server → Agent → MainForm → DeviceAgent.SendData() → BacnetBAS.SendData()
+        /// 
+        /// [입력 데이터]
+        /// cData: "AV-101,25.5;AV-102,30.0;"
+        ///   - sendType: 0 (제어 명령)
+        ///   - DataSize: 데이터 길이
+        /// 
+        /// [데이터 흐름]
+        /// 1. 제어 데이터 파싱 ("AV-101,25.5" → PointId, Value)
+        /// 2. _points에서 해당 포인트 검색
+        /// 3. BACnet WritePresentValue 실행
+        /// 4. 성공 여부 카운트
         /// </summary>
-        public override int SendData(int sendType, string cData, int dataSize)
+        public override int SendData(int sendType, string cData, int DataSize)
         {
-            BacnetLogger.SetCurrentDevice(_deviceSeq);
-
-            if (string.IsNullOrEmpty(cData))
+            if (!_isInitialized || _client == null)
             {
-                BacnetLogger.Warn("SendData: 수신 데이터 비어있음");
-                return 0;
+                _logger.Warning("초기화되지 않음, 제어 무시");
+                return -1;
             }
 
-            bool isControl = cData.IndexOf(';') >= 0;
-
-            return isControl
-                ? HandleControl(cData)
-                : HandleRead(sendType, cData);
-        }
-
-        #endregion
-
-        #region Read / Control
-
-        /// <summary>
-        /// [제어 데이터 흐름]
-        /// SI Client → Server → DeviceAgent → (DLL) SendData → HandleControl
-        ///
-        /// [cData 예시]
-        /// "AV-14,80;BV-1,1;AO-4,12.55;"
-        ///  - ';' 기준: 명령 N개
-        ///  - ',' 기준: (포인트키, 목표값)
-        ///
-        /// [정책]
-        /// - 명령 1개 = TB_BACNET_CONTROL_HISTORY 1 row
-        /// - PrevValue는 Realtime DB에서 조회 (BACnet 재조회 X)
-        /// - 실제 Write(Enumerated/Real 변환 포함)는 BacnetClientWrapper에서만 수행 (중복 제거)
-        /// </summary>
-        private int HandleControl(string cData)
-        {
-            // =========================================================
-            // cData 예시(멀티포인트):
-            //   "AV-14,100;BV-3,1;"
-            //
-            // 규칙:
-            //  - ';' 단위로 명령 분해
-            //  - 각 명령은 "SYSTEM_PT_ID,NEW_VALUE" 형태라고 가정
-            //    (옵션 값이 더 붙는 프로젝트도 있는데, 그건 뒤 토큰은 무시하는 쪽이 안전)
-            // =========================================================
-
-            int total = 0;
-            int ok = 0;
-
-            string[] commands = cData.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
-
-            BacnetLogger.Info(string.Format("[CTRL] START device_seq={0}, raw={1}", _deviceSeq, cData));
-
-            foreach (var cmd in commands)
+            try
             {
-                total++;
+                _logger.Info($"제어 명령 수신: {cData}");
 
-                string systemPtId = null;
-                string newValueRaw = null;
+                // ===== 1. 제어 데이터 파싱 =====
+                // "AV-101,25.5;AV-102,30.0;" → List<(PointId, Value)>
+                var controlRequests = ParseControlData(cData);
 
-                string prevValueStr = null;
-                string result = "FAIL";
-                string err = null;
-
-                try
+                if (controlRequests.Count == 0)
                 {
-                    // 1) "AV-14,100" → [0]=AV-14, [1]=100
-                    var parts = cmd.Split(new[] { ',' }, StringSplitOptions.None);
-                    if (parts.Length < 2)
+                    _logger.Warning("제어 데이터 파싱 실패");
+                    return 0;
+                }
+
+                _logger.Info($"제어 요청: {controlRequests.Count}건");
+
+                // ===== 2. 각 포인트별로 BACnet Write =====
+                int successCount = 0;
+
+                foreach (var req in controlRequests)
+                {
+                    // _points에서 해당 포인트 찾기
+                    var point = _points.FirstOrDefault(p => p.SystemPtId == req.PointId);
+
+                    if (point == null)
                     {
-                        err = "PARSE_FAILED: expected 'SYSTEM_PT_ID,NEW_VALUE'";
+                        _logger.Warning($"포인트 없음: {req.PointId}");
                         continue;
                     }
 
-                    systemPtId = (parts[0] ?? "").Trim();
-                    newValueRaw = (parts[1] ?? "").Trim();
+                    // BACnet Write 실행
+                    bool result = _client.WritePresentValue(
+                        point.DeviceInstance,
+                        point.ObjectType,
+                        point.ObjectInstance,
+                        req.Value
+                    );
 
-                    if (string.IsNullOrEmpty(systemPtId))
+                    if (result)
                     {
-                        err = "PARSE_FAILED: empty SYSTEM_PT_ID";
-                        continue;
-                    }
-
-                    // 2) PrevValue는 BACnet 재조회 금지(부하 + 타임아웃 리스크)
-                    //    → TB_BACNET_REALTIME에서 마지막 값을 읽는다.
-                    double? prev = _realtimeRepo.GetCurrentValue(_deviceSeq, systemPtId);
-                    prevValueStr = prev.HasValue ? prev.Value.ToString(CultureInfo.InvariantCulture) : null;
-
-                    // 3) SYSTEM_PT_ID → 실제 BACnetObjectTypes/Instance 매핑
-                    //    - P_OBJECT에 없으면 "미등록 포인트 제어"라서 실패로 남김
-                    var pt = _objectRepo.GetPointBySystemPtId(_deviceSeq, systemPtId);
-                    if (pt == null)
-                    {
-                        err = "POINT_NOT_FOUND_IN_P_OBJECT";
-                        continue;
-                    }
-
-                    // 4) 쓰기 값 타입 결정
-                    //    - BV/BO/MSV/MSO는 enum(정수)
-                    //    - 그 외는 실수(double)
-                    object writeValue;
-                    if (pt.BacnetType == BacnetObjectTypes.OBJECT_BINARY_VALUE ||
-                        pt.BacnetType == BacnetObjectTypes.OBJECT_BINARY_OUTPUT ||
-                        pt.BacnetType == BacnetObjectTypes.OBJECT_MULTI_STATE_VALUE ||
-                        pt.BacnetType == BacnetObjectTypes.OBJECT_MULTI_STATE_OUTPUT)
-                    {
-                        uint enumVal;
-                        if (!uint.TryParse(newValueRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out enumVal))
-                        {
-                            err = "VALUE_CONVERT_FAILED(enum)";
-                            continue;
-                        }
-                        writeValue = enumVal;
+                        successCount++;
+                        _logger.Debug($"제어 성공: {req.PointId} = {req.Value:F2}");
                     }
                     else
                     {
-                        double d;
-                        if (!double.TryParse(newValueRaw, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out d))
-                        {
-                            err = "VALUE_CONVERT_FAILED(real)";
-                            continue;
-                        }
-                        writeValue = d;
-                    }
-
-                    // 5) BACnet Write
-                    string writeErr;
-                    bool writeOk = _client.TryWritePresentValue(_station, pt.BacnetType, pt.Instance, writeValue, out writeErr);
-
-                    if (!writeOk)
-                    {
-                        err = "WRITE_FAILED: " + (writeErr ?? "unknown");
-                        continue;
-                    }
-
-                    result = "OK";
-                    ok++;
-                }
-                catch (Exception ex)
-                {
-                    // 포인트 1개 실패로 전체 제어가 죽으면 운영에서 지옥 열림
-                    err = "UNEXPECTED: " + ex.Message;
-                    BacnetLogger.Error(
-                        string.Format("[CTRL][ERROR] Unexpected. device_seq={0}, cmd={1}", _deviceSeq, cmd),
-                        ex);
-                }
-                finally
-                {
-                    // =========================================================
-                    // 6) 제어 히스토리 기록(포인트당 1행)
-                    //    - 성공/실패 모두 남긴다.
-                    //    - 실패 원인은 ErrorMessage에 문자열로 박는다.
-                    // =========================================================
-                    try
-                    {
-                        _controlHistoryRepo.Insert(
-                            _deviceSeq,
-                            systemPtId,
-                            prevValueStr,
-                            newValueRaw,
-                            result,
-                            err,
-                            controlUser: null,   // 지금 Agent가 유저를 안주면 null 유지
-                            isDryRun: false,
-                            source: "SI");
-                    }
-                    catch (Exception ex)
-                    {
-                        // 히스토리 기록 실패는 제어 자체와 별개로 로깅만 하고 넘김(제어 성공까지 롤백하면 더 위험)
-                        BacnetLogger.Error(
-                            string.Format("[CTRL][ERROR] History insert failed. device_seq={0}, pt={1}", _deviceSeq, systemPtId),
-                            ex);
+                        _logger.Warning($"제어 실패: {req.PointId}");
                     }
                 }
+
+                _logger.Info($"제어 완료: {successCount}/{controlRequests.Count}건 성공");
+
+                return successCount;
             }
-
-            BacnetLogger.Info(string.Format("[CTRL] END device_seq={0}, totalCmd={1}, ok={2}", _deviceSeq, total, ok));
-            return ok;
+            catch (Exception ex)
+            {
+                _logger.Error("제어 처리 에러", ex);
+                return -1;
+            }
         }
 
-
-
         /// <summary>
-        /// 읽기 처리
-        /// 요청: "BI-1,AO-2,"
-        /// 응답: "BI-1,1,0;AO-2,23.5,0;"
+        /// 제어 데이터 파싱
+        /// 
+        /// [입력]
+        /// "AV-101,25.5;AV-102,30.0;BI-39,1;"
+        /// 
+        /// [출력]
+        /// List<(PointId, Value)>
+        ///   - ("AV-101", 25.5)
+        ///   - ("AV-102", 30.0)
+        ///   - ("BI-39", 1.0)
+        /// 
+        /// [처리]
+        /// - 세미콜론(;)으로 분리
+        /// - 각 항목을 콤마(,)로 분리
+        /// - float 변환 실패 시 제외
         /// </summary>
-        private int HandleRead(int sendType, string cData)
+        private List<(string PointId, float Value)> ParseControlData(string cData)
         {
-            var snapshot = _realtimeRepo.GetSnapshotByDevice(_deviceSeq);
-            var sb = new StringBuilder();
+            var result = new List<(string, float)>();
 
-            string[] tokens = cData.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-            int count = 0;
+            if (string.IsNullOrEmpty(cData))
+                return result;
 
-            foreach (string pt in tokens)
+            try
             {
-                double value = snapshot.TryGetValue(pt, out double v)
-                    ? v
-                    : RealtimeConstants.FailValue;
+                // "AV-101,25.5;AV-102,30.0;" → ["AV-101,25.5", "AV-102,30.0"]
+                var items = cData.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
 
-                sb.AppendFormat(
-                    CultureInfo.InvariantCulture,
-                    "{0},{1},0;",
-                    pt,
-                    value
-                );
-                count++;
+                foreach (var item in items)
+                {
+                    var trimmed = item.Trim();
+                    if (string.IsNullOrEmpty(trimmed))
+                        continue;
+
+                    // "AV-101,25.5" → ["AV-101", "25.5"]
+                    int commaIndex = trimmed.IndexOf(',');
+                    if (commaIndex > 0 && commaIndex < trimmed.Length - 1)
+                    {
+                        string pointId = trimmed.Substring(0, commaIndex).Trim();
+                        string valueStr = trimmed.Substring(commaIndex + 1).Trim();
+
+                        if (float.TryParse(valueStr, out float value))
+                        {
+                            result.Add((pointId, value));
+                        }
+                        else
+                        {
+                            _logger.Warning($"값 파싱 실패: {trimmed}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("제어 데이터 파싱 에러", ex);
             }
 
-            string response = sb.ToString();
-
-            BacnetLogger.Info($"[READ][ToReceive] count={count}, data={response}");
-
-            ToReceive(
-                _deviceSeq,
-                sendType,
-                response,
-                count
-            );
-
-            return count;
+            return result;
         }
 
         #endregion
 
-        #region Helpers
+        #region 종료
 
-        private void BuildPointCache()
+        /// <summary>
+        /// DLL 종료 (리소스 해제)
+        /// 
+        /// [호출 경로]
+        /// MainForm.Close() → DeviceAgent.DisConnect() → BacnetBAS.DisConnect()
+        /// 
+        /// [처리 순서]
+        /// 1. 폴링 스레드 정지
+        /// 2. BACnet 연결 종료
+        /// 3. 초기화 플래그 리셋
+        /// </summary>
+        public override bool DisConnect()
         {
-            _pointMap = new Dictionary<string, BacnetPointInfo>(StringComparer.OrdinalIgnoreCase);
-            foreach (var p in _objectRepo.GetPointsByDeviceSeq(_deviceSeq))
+            try
             {
-                if (!string.IsNullOrEmpty(p.SystemPtId))
-                    _pointMap[p.SystemPtId] = p;
+                if (_logger != null)
+                {
+                    _logger.Info("BacnetBAS 종료 중...");
+                }
+
+                // ===== 1. 폴링 스레드 정지 =====
+                _isRunning = false;
+
+                if (_pollingThread != null && _pollingThread.IsAlive)
+                {
+                    // 5초 대기 후 강제 종료
+                    if (!_pollingThread.Join(5000))
+                    {
+                        if (_logger != null)
+                        {
+                            _logger.Warning("폴링 스레드 강제 종료");
+                        }
+                        _pollingThread.Abort();
+                    }
+                }
+
+                // ===== 2. BACnet 연결 종료 =====
+                if (_client != null)
+                {
+                    _client.Dispose();
+                    _client = null;
+                }
+
+                // ===== 3. 초기화 플래그 리셋 =====
+                _isInitialized = false;
+
+                if (_logger != null)
+                {
+                    _logger.Info("BacnetBAS 종료 완료");
+                }
+
+                return true;
             }
-
-            BacnetLogger.Info($"BuildPointCache 완료. count={_pointMap.Count}");
-        }
-
-        private bool TryControlPoint(string systemPtId, double value)
-        {
-            if (!_pointMap.TryGetValue(systemPtId, out var pt))
+            catch (Exception ex)
+            {
+                if (_logger != null)
+                {
+                    _logger.Error("종료 에러", ex);
+                }
                 return false;
-
-            bool ok = _client.TryWritePresentValue(
-                _station,
-                pt.BacnetType,
-                pt.Instance,
-                value,
-                out string error);
-
-            if (!ok)
-                BacnetLogger.Warn($"제어 실패: {systemPtId}, error={error}");
-            else
-                _realtimeRepo.UpsertRealtime(
-                    _deviceSeq,
-                    systemPtId,
-                    value,
-                    RealtimeConstants.QualityGood,
-                    DateTime.Now,
-                    null);
-
-            return ok;
+            }
         }
 
         #endregion

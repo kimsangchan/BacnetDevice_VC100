@@ -4,16 +4,17 @@
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
     <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
-    <ProjectGuid>{D9EA5C36-BDF9-428D-8ED7-15018A8AC997}</ProjectGuid>
-    <OutputType>Library</OutputType>
-    <AppDesignerFolder>Properties</AppDesignerFolder>
-    <RootNamespace>BacnetDevice_VC100</RootNamespace>
-    <AssemblyName>BacnetDevice_VC100</AssemblyName>
+    <ProjectGuid>{363A76D7-D595-47B6-B792-B658DBCEE0DF}</ProjectGuid>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Test</RootNamespace>
+    <AssemblyName>Test</AssemblyName>
     <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <PlatformTarget>AnyCPU</PlatformTarget>
     <DebugSymbols>true</DebugSymbols>
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
@@ -23,6 +24,7 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <PlatformTarget>AnyCPU</PlatformTarget>
     <DebugType>pdbonly</DebugType>
     <Optimize>true</Optimize>
     <OutputPath>bin\Release\</OutputPath>
@@ -31,14 +33,7 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="BACnet">
-      <HintPath>..\..\BacnetClientWrapper\BacnetClientWrapper\bin\Debug\BACnet.dll</HintPath>
-    </Reference>
-    <Reference Include="CShapeDeviceAgent">
-      <HintPath>..\..\..\..\Downloads\Archive\SmartDeviceAgent(BAS)-3\DeviceDLL\CShapeDeviceAgent.dll</HintPath>
-    </Reference>
     <Reference Include="System" />
-    <Reference Include="System.Configuration" />
     <Reference Include="System.Core" />
     <Reference Include="System.Xml.Linq" />
     <Reference Include="System.Data.DataSetExtensions" />
@@ -48,34 +43,11 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="DataAccess\SqlConnectionFactory.cs" />
-    <Compile Include="Device\BacnetBAS.cs" />
-    <Compile Include="Model\BacnetPoint.cs" />
-    <Compile Include="Model\ReadResult.cs" />
-    <Compile Include="Protocol\BacnetClientWrapper.cs" />
-    <Compile Include="Protocol\IBacnetClient.cs" />
-    <Compile Include="Protocol\MockBacnetClient.cs" />
-    <Compile Include="Service\DeviceConfigService.cs" />
-    <Compile Include="Util\BacnetLogger.cs" />
+    <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
-    <Compile Include="Util\PasswordDecryptor.cs" />
-  </ItemGroup>
-  <ItemGroup>
-    <PackageReference Include="BACnet">
-      <Version>3.0.1</Version>
-    </PackageReference>
-    <PackageReference Include="Common.Logging">
-      <Version>3.4.1</Version>
-    </PackageReference>
-    <PackageReference Include="Common.Logging.Core">
-      <Version>3.4.1</Version>
-    </PackageReference>
   </ItemGroup>
   <ItemGroup>
     <None Include="App.config" />
-  </ItemGroup>
-  <ItemGroup>
-    <Folder Include="Bacnet\" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
