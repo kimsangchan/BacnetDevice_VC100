@@ -1,423 +1,141 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Data;
 using System.Data.SqlClient;
 using System.IO;
-using System.IO.BACnet;
 using System.Xml.Linq;
 using BacnetDevice_VC100.Model;
 using BacnetDevice_VC100.Util;
 
-namespace BacnetDevice_VC100.Data
+// ⭐ 네임스페이스를 BacnetBAS.cs에서 using한 것과 일치시킴
+namespace BacnetDevice_VC100.Service
 {
-    /// <summary>
-    /// 장비 설정 서비스
-    /// 
-    /// [역할]
-    /// - DB에서 포인트 설정 로딩
-    /// - Config.XML에서 DB 연결 정보 읽기
-    /// </summary>
     public class DeviceConfigService
     {
         private readonly int _deviceSeq;
         private readonly BacnetLogger _logger;
-        private readonly string _connectionString;
+        private string _connectionString;
 
-        /// <summary>
-        /// 생성자
-        /// 
-        /// [처리 순서]
-        /// 1. Config.XML에서 DB 연결 정보 읽기
-        /// 2. ConnectionString 생성
-        /// </summary>
         public DeviceConfigService(int deviceSeq, BacnetLogger logger)
         {
             _deviceSeq = deviceSeq;
-            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-
-            // Config.XML에서 DB 연결 정보 읽기
-            _connectionString = LoadConnectionStringFromConfig();
-        }
-
-        /// <summary>
-        /// Config.XML에서 DB 연결 문자열 읽기
-        /// 
-        /// [Config.XML 경로]
-        /// 실행폴더\xml\Config.xml
-        /// 
-        /// [데이터 흐름]
-        /// AppDomain.CurrentDomain.BaseDirectory
-        ///   ↓ "C:\Surable\SmartDeviceAgent(bIoT)-1\"
-        ///   ↓ Path.Combine(exePath, "xml", "Config.xml")
-        ///   ↓ "C:\Surable\SmartDeviceAgent(bIoT)-1\xml\Config.xml"
-        ///   ↓ XDocument.Load()
-        ///   ↓ <Common> 노드 읽기
-        ///   ↓ ServerIP, DBMainDataBaseName, DBUserID, DBUserPass
-        ///   ↓ PasswordDecryptor.Decrypt(encryptedPassword)
-        ///   ↓ ConnectionString 생성
-        /// </summary>
-        private string LoadConnectionStringFromConfig()
-        {
+            _logger = logger;
+            // ⭐ 생성자에서 예외 발생 가능성 있음! 안전하게 처리 필요
             try
             {
-                string exePath = AppDomain.CurrentDomain.BaseDirectory;
-                string configPath = System.IO.Path.Combine(exePath, "xml", "Config.xml");
-
-                _logger.Info($"=== Config.XML 로딩 시작 ===");
-                _logger.Info($"경로: {configPath}");
-                _logger.Info($"존재: {System.IO.File.Exists(configPath)}");
-
-                if (!System.IO.File.Exists(configPath))
-                {
-                    _logger.Error($"Config.XML 파일 없음");
-                    return GetFallbackConnectionString();
-                }
-
-                XDocument doc = XDocument.Load(configPath);
-                var commonNode = doc.Root?.Element("Common");
-
-                _logger.Info($"Common 노드: {(commonNode == null ? "없음" : "있음")}");
-
-                if (commonNode == null)
-                {
-                    _logger.Error("Common 노드 없음");
-                    return GetFallbackConnectionString();
-                }
-
-                string server = commonNode.Element("ServerIP")?.Attribute("value")?.Value;
-                string database = commonNode.Element("DB_MainDataBaseName")?.Attribute("value")?.Value;
-                string userId = commonNode.Element("DB_UserID")?.Attribute("value")?.Value;
-
-                _logger.Info($"Server: [{server ?? "NULL"}]");
-                _logger.Info($"Database: [{database ?? "NULL"}]");
-                _logger.Info($"UserID: [{userId ?? "NULL"}]");
-
-                if (string.IsNullOrEmpty(server) ||
-                    string.IsNullOrEmpty(database) ||
-                    string.IsNullOrEmpty(userId))
-                {
-                    _logger.Error("필수 정보 없음");
-                    return GetFallbackConnectionString();
-                }
-
-                // ===== 강제로 평문 사용 =====
-                _logger.Warning("🔥 강제: 평문 비밀번호 사용 (admin123!@#)");
-                string password = "admin123!@#";
-
-                string connectionString = $"Server={server};Database={database};User Id={userId};Password={password};";
-
-                _logger.Info("DB 연결 문자열 생성 완료");
-                _logger.Info($"ConnectionString: {connectionString}");
-
-                return connectionString;
+                _connectionString = LoadConnectionString();
             }
             catch (Exception ex)
             {
-                _logger.Error("Config.XML 로딩 실패", ex);
-                return GetFallbackConnectionString();
+                _logger.Error("ConnectionString 로드 실패", ex);
+                _connectionString = ""; // 빈 문자열로 초기화해서 NullReference 방지
             }
         }
 
-        private string GetFallbackConnectionString()
+        private string LoadConnectionString()
         {
-            _logger.Warning("Fallback 사용");
-            return "Server=192.168.131.127;Database=IBSInfo;User Id=sa;Password=admin123!@#;";
-        }
-
-
-
-
-
-        /// <summary>
-        /// 비밀번호 처리 (암호화 또는 평문)
-        /// 
-        /// [처리 순서]
-        /// passwordValue (암호화된 값)
-        ///   ↓ IsBase64String() → Base64 형식?
-        ///   ↓ true → PasswordDecryptor.Decrypt()
-        ///     ↓ Base64 디코딩
-        ///     ↓ XOR 복호화
-        ///     ↓ "admin123!@#" (평문)
-        ///   ↓ false → 평문으로 사용
-        ///   ↓
-        /// return 복호화된 비밀번호
-        /// </summary>
-        private string ProcessPassword(string passwordValue)
-        {
-            if (string.IsNullOrEmpty(passwordValue))
-            {
-                _logger.Warning("비밀번호가 없습니다");
-                return string.Empty;
-            }
-
             try
             {
-                _logger.Info($"비밀번호 원본: {passwordValue}");
+                // Config.xml 경로 (실행 파일 기준)
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "XML", "Config.xml");
 
-                // ===== 임시: 복호화 건너뛰고 평문 테스트 =====
-                _logger.Warning("임시: 평문 비밀번호 'admin123!@#' 사용 (테스트)");
-                return "admin123!@#";
-                // ===== 임시 코드 끝 =====
-
-                /*
-                bool isBase64 = IsBase64String(passwordValue);
-
-                _logger.Info($"Base64 형식 여부: {isBase64}");
-
-                if (isBase64)
+                // 파일이 없으면 에러 로그 찍고 기본값 리턴 (또는 null)
+                if (!File.Exists(path))
                 {
-                    _logger.Info("암호화된 비밀번호 감지, 복호화 시도");
+                    _logger.Error($"Config.xml 파일 없음: {path}");
+                    return GetDefaultConnectionString();
+                }
 
-                    string decrypted = PasswordDecryptor.Decrypt(passwordValue);
+                var doc = XDocument.Load(path);
+                var common = doc.Root?.Element("Common");
 
-                    _logger.Info($"복호화 결과: {decrypted}");
+                string server = common?.Element("ServerIP")?.Attribute("value")?.Value ?? "127.0.0.1";
+                string db = common?.Element("DB_MainDataBaseName")?.Attribute("value")?.Value ?? "IBSInfo";
+                string id = common?.Element("DB_UserID")?.Attribute("value")?.Value ?? "sa";
 
-                    if (!string.IsNullOrEmpty(decrypted) && decrypted != passwordValue)
+                // ⭐ 암호화된 비밀번호 읽기 (예: "OXGdXW6Vuj6Hny7mwhmvgdieuhEhlJW6...")
+                string encryptedPw = common?.Element("DB_UserPass")?.Attribute("value")?.Value;
+                string pw = "admin123!@#"; // 기본값 (복호화 실패 시 대비)
+
+                if (!string.IsNullOrEmpty(encryptedPw))
+                {
+                    try
                     {
-                        _logger.Info("비밀번호 복호화 성공");
-                        return decrypted;
+                        // ⭐ 여기서 복호화 필수!
+                        string decrypted = PasswordDecryptor.Decrypt(encryptedPw);
+                        // ⭐ 이 로그를 꼭 확인하세요! (비밀번호 노출 주의)
+                        _logger.Info($"[Debug] Encrypted: {encryptedPw}, Decrypted: {decrypted}");
                     }
-
-                    _logger.Warning("비밀번호 복호화 실패, 평문으로 시도");
+                    catch (Exception ex)
+                    {
+                        _logger.Error("비밀번호 복호화 실패, 기본값 사용", ex);
+                    }
                 }
 
-                _logger.Info("평문 비밀번호 사용");
-                return passwordValue;
-                */
+                return $"Server={server};Database={db};User Id={id};Password={pw};";
             }
             catch (Exception ex)
             {
-                _logger.Error("비밀번호 처리 에러", ex);
-                return "admin123!@#"; // Fallback
+                _logger.Error("Config 로드 실패", ex);
+                return GetDefaultConnectionString();
             }
         }
 
-
-        /// <summary>
-        /// Base64 문자열인지 확인
-        /// 
-        /// [데이터 흐름]
-        /// IsBase64String("OXGdXW6Vuj6Hny7mwhmvgdieuhEhlJW6")
-        ///   ↓ null 체크 → false
-        ///   ↓ 길이 % 4 == 0? → true (32자, 4의 배수)
-        ///   ↓ Convert.FromBase64String() 시도
-        ///     ↓ 성공 → return true
-        ///     ↓ 실패 → return false
-        /// 
-        /// [Base64 조건]
-        /// - 길이가 4의 배수
-        /// - A-Z, a-z, 0-9, +, /, = 문자만 포함
-        /// </summary>
-        private bool IsBase64String(string value)
+        private string GetDefaultConnectionString()
         {
-            if (string.IsNullOrEmpty(value))
-                return false;
-
-            // Base64는 길이가 4의 배수
-            if (value.Length % 4 != 0)
-                return false;
-
-            try
-            {
-                // Base64 디코딩 시도
-                Convert.FromBase64String(value);
-                return true;
-            }
-            catch
-            {
-                // 디코딩 실패 = Base64 아님
-                return false;
-            }
+            return "Server=127.0.0.1;Database=IBSInfo;User Id=sa;Password=admin123!@#;";
         }
 
-        /// <summary>
-        /// DB 연결 생성
-        /// </summary>
-        private SqlConnection CreateConnection()
-        {
-            return new SqlConnection(_connectionString);
-        }
-
-        /// <summary>
-        /// DB에서 포인트 설정 로딩
-        /// 
-        /// [데이터 흐름]
-        /// P_OBJECT 테이블 (DEVICE_SEQ, SYSTEM_PT_ID, OBJ_TYPE)
-        ///   ↓
-        /// ParsePointFromReader()
-        ///   ↓
-        /// List<BacnetPoint> (SystemPtId, ObjectType, ObjectInstance)
-        /// 
-        /// [쿼리]
-        /// SELECT SYSTEM_PT_ID, OBJ_TYPE
-        /// FROM P_OBJECT
-        /// WHERE DEVICE_SEQ = @deviceSeq
-        /// ORDER BY OBJ_COUNT ASC
-        /// </summary>
         public List<BacnetPoint> LoadPoints()
         {
             var points = new List<BacnetPoint>();
-            int totalRows = 0;
-            int skipCount = 0;
-
             try
             {
-                _logger.Info($"포인트 로딩 시작: DeviceSeq={_deviceSeq}");
-
-                using (var conn = CreateConnection())
+                using (var conn = new SqlConnection(_connectionString))
                 {
                     conn.Open();
-
-                    string query = @"
-                        SELECT 
-                            SYSTEM_PT_ID,
-                            OBJ_TYPE
-                        FROM P_OBJECT
-                        WHERE DEVICE_SEQ = @deviceSeq
-                        ORDER BY OBJ_COUNT ASC";
+                    // P_OBJECT 테이블에서 해당 장비의 포인트 조회
+                    string query = @"SELECT SYSTEM_PT_ID, OBJ_TYPE, OBJ_COUNT 
+                                     FROM P_OBJECT 
+                                     WHERE DEVICE_SEQ = @DeviceSeq 
+                                     ORDER BY OBJ_COUNT";
 
                     using (var cmd = new SqlCommand(query, conn))
                     {
-                        cmd.Parameters.AddWithValue("@deviceSeq", _deviceSeq);
+                        cmd.Parameters.AddWithValue("@DeviceSeq", _deviceSeq);
 
                         using (var reader = cmd.ExecuteReader())
                         {
                             while (reader.Read())
                             {
-                                totalRows++;
-                                var point = ParsePointFromReader(reader);
+                                string ptId = reader["SYSTEM_PT_ID"].ToString();
+                                int typeCode = Convert.ToInt32(reader["OBJ_TYPE"]);
 
-                                if (point != null)
+                                // BacnetPoint 파싱 로직 (이전 코드 참조)
+                                try
                                 {
-                                    points.Add(point);
+                                    var (objType, instance) = BacnetPoint.ParseSystemPtId(ptId);
+                                    points.Add(new BacnetPoint
+                                    {
+                                        SystemPtId = ptId,
+                                        ObjectType = objType,
+                                        ObjectInstance = instance,
+                                        DeviceInstance = (uint)_deviceSeq
+                                    });
                                 }
-                                else
+                                catch
                                 {
-                                    skipCount++;
+                                    _logger.Warning($"잘못된 포인트 ID: {ptId}");
                                 }
                             }
                         }
                     }
                 }
-
-                _logger.Info($"포인트 로딩 완료: {points.Count}개 (전체: {totalRows}, 제외: {skipCount})");
-
-                if (skipCount > 0)
-                {
-                    _logger.Warning($"제외된 포인트: {skipCount}개");
-                }
-
-                return points;
             }
             catch (Exception ex)
             {
-                _logger.Error("포인트 로딩 실패", ex);
-                return new List<BacnetPoint>();
+                _logger.Error("DB 포인트 로딩 실패", ex);
             }
-        }
-
-        /// <summary>
-        /// DB Reader에서 BacnetPoint 파싱
-        /// 
-        /// [입력]
-        /// - SYSTEM_PT_ID: "AV-101", "BI-39" 등
-        /// - OBJ_TYPE: 0(AI), 1(AO), 2(AV), 3(BI), 4(BO), 5(BV), ...
-        /// 
-        /// [출력]
-        /// BacnetPoint {
-        ///   SystemPtId = "AV-101",
-        ///   ObjectType = OBJECT_ANALOG_VALUE,
-        ///   ObjectInstance = 101
-        /// }
-        /// </summary>
-        private BacnetPoint ParsePointFromReader(IDataReader reader)
-        {
-            try
-            {
-                string systemPtId = reader["SYSTEM_PT_ID"].ToString().Trim();
-
-                if (string.IsNullOrEmpty(systemPtId))
-                {
-                    return null;
-                }
-
-                int objType = Convert.ToInt32(reader["OBJ_TYPE"]);
-                BacnetObjectTypes bacnetObjectType = ConvertObjectTypeFromDB(objType);
-
-                // SYSTEM_PT_ID에서 Instance 추출 (예: "BI-39" → 39)
-                if (!systemPtId.Contains("-"))
-                {
-                    _logger.Warning($"포인트 제외 (형식 오류): {systemPtId}");
-                    return null;
-                }
-
-                string[] parts = systemPtId.Split('-');
-                if (parts.Length < 2)
-                {
-                    _logger.Warning($"포인트 제외 (파싱 실패): {systemPtId}");
-                    return null;
-                }
-
-                string instanceStr = parts[parts.Length - 1].Trim();
-
-                if (!uint.TryParse(instanceStr, out uint objectInstance))
-                {
-                    _logger.Warning($"포인트 제외 (Instance 오류): {systemPtId}");
-                    return null;
-                }
-
-                return new BacnetPoint
-                {
-                    DeviceSeq = _deviceSeq,
-                    SystemPtId = systemPtId,
-                    DeviceInstance = (uint)_deviceSeq,
-                    ObjectType = bacnetObjectType,
-                    ObjectInstance = objectInstance,
-                    IsWritable = false,
-                    EnablePolling = true,
-                    PollingInterval = 30,
-                    FailValue = 0.0f,
-                    TimeoutMs = 5000
-                };
-            }
-            catch (Exception ex)
-            {
-                _logger.Error("포인트 파싱 에러", ex);
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// DB OBJ_TYPE을 BACnet ObjectType으로 변환
-        /// 
-        /// [매핑]
-        /// 0 → AI (Analog Input)
-        /// 1 → AO (Analog Output)
-        /// 2 → AV (Analog Value)
-        /// 3 → BI (Binary Input)
-        /// 4 → BO (Binary Output)
-        /// 5 → BV (Binary Value)
-        /// 6 → MSI (Multi-State Input)
-        /// 7 → MSO (Multi-State Output)
-        /// 8 → MSV (Multi-State Value)
-        /// </summary>
-        private BacnetObjectTypes ConvertObjectTypeFromDB(int objType)
-        {
-            switch (objType)
-            {
-                case 0: return BacnetObjectTypes.OBJECT_ANALOG_INPUT;
-                case 1: return BacnetObjectTypes.OBJECT_ANALOG_OUTPUT;
-                case 2: return BacnetObjectTypes.OBJECT_ANALOG_VALUE;
-                case 3: return BacnetObjectTypes.OBJECT_BINARY_INPUT;
-                case 4: return BacnetObjectTypes.OBJECT_BINARY_OUTPUT;
-                case 5: return BacnetObjectTypes.OBJECT_BINARY_VALUE;
-                case 6: return BacnetObjectTypes.OBJECT_MULTI_STATE_INPUT;
-                case 7: return BacnetObjectTypes.OBJECT_MULTI_STATE_OUTPUT;
-                case 8: return BacnetObjectTypes.OBJECT_MULTI_STATE_VALUE;
-                default:
-                    _logger.Warning($"알 수 없는 OBJ_TYPE: {objType}, 기본값(AV) 사용");
-                    return BacnetObjectTypes.OBJECT_ANALOG_VALUE;
-            }
+            return points;
         }
     }
 }

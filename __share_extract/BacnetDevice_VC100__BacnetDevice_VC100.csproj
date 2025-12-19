@@ -49,7 +49,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="DataAccess\SqlConnectionFactory.cs" />
-    <Compile Include="BacnetBAS.cs" />
+    <Compile Include="Device\BacnetBAS.cs" />
     <Compile Include="Model\BacnetPoint.cs" />
     <Compile Include="Model\ReadResult.cs" />
     <Compile Include="Protocol\BacnetClientWrapper.cs" />
@@ -74,6 +74,8 @@
   <ItemGroup>
     <None Include="App.config" />
   </ItemGroup>
-  <ItemGroup />
+  <ItemGroup>
+    <Folder Include="Bacnet\" />
+  </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>

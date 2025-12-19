@@ -5,6 +5,7 @@ using System.IO.BACnet;
 using BacnetDevice_VC100.Util;
 using BacnetDevice_VC100.Protocol;
 using BacnetDevice_VC100.Model;
+using BacnetDevice_VC100.Data;
 using System.Text;
 
 namespace BacnetDevice_VC100.Test

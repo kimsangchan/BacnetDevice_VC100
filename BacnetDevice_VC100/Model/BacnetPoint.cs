@@ -1,38 +1,47 @@
-﻿using System.IO.BACnet;  // ← 이 줄 추가!
+﻿using System;
+using System.IO.BACnet; // BACnet 라이브러리 참조 필요
 
 namespace BacnetDevice_VC100.Model
 {
-    /// <summary>
-    /// BACnet 포인트 정의
-    /// - DB: P_OBJECT 테이블에서 로딩
-    /// - 각 포인트의 BACnet 속성 + 폴링 설정
-    /// </summary>
     public class BacnetPoint
     {
-        // === 식별 정보 ===
-        public int DeviceSeq { get; set; }              // Device ID
-        public string SystemPtId { get; set; }          // SI 포인트 ID (예: "AV-101")
+        public string SystemPtId { get; set; }
+        public BacnetObjectTypes ObjectType { get; set; }
+        public uint ObjectInstance { get; set; }
+        public uint DeviceInstance { get; set; } = 1;
+        public float FailValue { get; set; } = 0.0f;
 
-        // === BACnet 속성 ===
-        public uint DeviceInstance { get; set; }        // BACnet Device Instance
-        public BacnetObjectTypes ObjectType { get; set; } // AI/AO/AV/BI/BO/BV
-        public uint ObjectInstance { get; set; }        // Object Instance Number
-
-        // === 설정 ===
-        public bool IsWritable { get; set; }            // 제어 가능 여부
-        public bool EnablePolling { get; set; }         // 폴링 활성화
-        public int PollingInterval { get; set; }        // 폴링 주기 (초)
-
-        // === 품질 관리 ===
-        public float FailValue { get; set; }            // 통신 실패 시 기본값
-        public int TimeoutMs { get; set; }              // 타임아웃 (ms)
-
-        public BacnetPoint()
+        // C# 7.3 호환 메서드
+        public static Tuple<BacnetObjectTypes, uint> ParseSystemPtId(string systemPtId)
         {
-            TimeoutMs = 5000;
-            FailValue = 0.0f;
-            EnablePolling = true;
-            PollingInterval = 30;
+            if (string.IsNullOrEmpty(systemPtId))
+                throw new ArgumentException("Point ID empty");
+
+            var parts = systemPtId.Split('-');
+            if (parts.Length != 2)
+                throw new ArgumentException("Invalid Point ID: " + systemPtId);
+
+            string typeStr = parts[0].ToUpper();
+            uint instance;
+            if (!uint.TryParse(parts[1], out instance))
+                throw new ArgumentException("Invalid Instance: " + parts[1]);
+
+            BacnetObjectTypes type;
+            switch (typeStr)
+            {
+                case "AI": type = BacnetObjectTypes.OBJECT_ANALOG_INPUT; break;
+                case "AO": type = BacnetObjectTypes.OBJECT_ANALOG_OUTPUT; break;
+                case "AV": type = BacnetObjectTypes.OBJECT_ANALOG_VALUE; break;
+                case "BI": type = BacnetObjectTypes.OBJECT_BINARY_INPUT; break;
+                case "BO": type = BacnetObjectTypes.OBJECT_BINARY_OUTPUT; break;
+                case "BV": type = BacnetObjectTypes.OBJECT_BINARY_VALUE; break;
+                case "MSI": type = BacnetObjectTypes.OBJECT_MULTI_STATE_INPUT; break;
+                case "MSO": type = BacnetObjectTypes.OBJECT_MULTI_STATE_OUTPUT; break;
+                case "MSV": type = BacnetObjectTypes.OBJECT_MULTI_STATE_VALUE; break;
+                default: type = BacnetObjectTypes.OBJECT_ANALOG_VALUE; break;
+            }
+
+            return new Tuple<BacnetObjectTypes, uint>(type, instance);
         }
     }
 }
