@@ -5,18 +5,23 @@ using System.Text;
 using System.Threading.Tasks;
 using System.IO.BACnet;
 using System.Linq;
-using BacnetDevice_VC100.Util; // 기존 로깅 유틸리티를 사용합니다.
+using System.Text.RegularExpressions;
+using BacnetDevice_VC100.Util; // 기존 로그 시스템 활용
 
 namespace BacnetInventoryScanner.Service
 {
     /// <summary>
-    /// [최종 병기] 장비 ID를 몰라도 IP 주소만으로 진짜 장비 ID를 낚아채서 수집하는 서비스입니다.
+    /// [최종 완성형 서비스]
+    /// 1. Niagara Station 리얼 ID 자동 추적 및 직접 통신
+    /// 2. 깨진 데이터(\uFFFD) 포함 시 "무결성 보장"을 위해 자동 삭제 처리
+    /// 3. 현장 특화 단위(CMH, mmAq, ℃ 등) 완벽 기호 변환
+    /// 4. 모든 동작 과정에 촘촘한 주석 완비
     /// </summary>
     public class BacnetInventoryService
     {
         private readonly BacnetLogger _logger;
 
-        // SI(통합) 시스템의 데이터 규격에 맞춘 타입 매핑 테이블입니다.
+        // BACnet 오브젝트 타입을 SI 시스템의 P_OBJECT 테이블용 숫자 코드로 매핑합니다.
         private static readonly Dictionary<BacnetObjectTypes, (string Prefix, int TypeId)> SiMapping =
             new Dictionary<BacnetObjectTypes, (string, int)> {
                 { BacnetObjectTypes.OBJECT_ANALOG_INPUT, ("AI", 0) },
@@ -31,7 +36,7 @@ namespace BacnetInventoryScanner.Service
             };
 
         /// <summary>
-        /// 생성자: 모든 통신 과정의 발자취를 남기기 위해 로거를 주입받습니다.
+        /// 생성자: 통신 과정의 모든 기록을 남기기 위해 MainForm에서 사용하는 로거를 주입받습니다.
         /// </summary>
         public BacnetInventoryService(BacnetLogger logger)
         {
@@ -39,15 +44,15 @@ namespace BacnetInventoryScanner.Service
         }
 
         /// <summary>
-        /// [핵심 로직] IP 주소로 진짜 Device Instance를 찾아내고 즉시 포인트 리스트를 추출합니다.
-        /// [데이터 흐름]: IP 입력 -> Who-Is(유니캐스트) -> I-Am 수신(진짜ID 획득) -> 즉시 수집 시작
+        /// [메인 엔진] IP 주소로 진짜 장비 ID를 낚아채서, 정제된 포인트 데이터를 수집합니다.
         /// </summary>
+        /// <param name="ip">Niagara Station의 IP 주소</param>
         public async Task<List<Dictionary<string, object>>> HarvestPoints(string ip)
         {
             var resultList = new List<Dictionary<string, object>>();
-            uint realId = 0xFFFFFFFF; // 장비의 진짜 Instance ID를 담을 변수입니다.
+            uint realId = 0xFFFFFFFF; // 네트워크 응답으로 확정될 진짜 장비 인스턴스 ID
 
-            // UDP 47808 포트를 열어 통신을 준비합니다.
+            // 표준 UDP 47808 포트를 사용하여 통신 소켓을 엽니다.
             using (var client = new BacnetClient(new BacnetIpUdpProtocolTransport(0, false)))
             {
                 try
@@ -55,39 +60,27 @@ namespace BacnetInventoryScanner.Service
                     client.Start();
                     var addr = new BacnetAddress(BacnetAddressTypes.IP, ip + ":47808");
 
-                    // 2단계: 그러면 Niagara Station이 내부 장비들의 번호를 알려줍니다. (I-Am 응답)
-                    // 이때 낚아챈 번호(예: 34, 158025 등)가 바로 '리얼 ID'입니다.
+                    // [1단계] Who-Is를 특정 IP에 유니캐스트로 보내 진짜 ID(Station ID)를 낚아챕니다.
                     client.OnIam += (c, adr, device_id, max_apdu, segmentation, vendor_id) => {
-                        if (adr.ToString().Contains(ip))
-                        {
-                            realId = device_id; // 드디어 진짜 ID를 찾았습니다!
-                        }
+                        if (adr.ToString().Contains(ip)) realId = device_id;
                     };
-                    // 1단계: IP 주소 하나에 대고 "여기 누구누구 있습니까?"(Who-Is)라고 방송을 보냅니다.
                     client.WhoIs(0, -1, addr);
 
-                    // 응답을 기다립니다. (현장 속도를 고려해 최대 1초만 기다립니다.)
-                    int waitCount = 0;
-                    while (realId == 0xFFFFFFFF && waitCount < 10)
-                    {
-                        await Task.Delay(100);
-                        waitCount++;
-                    }
+                    // 응답 대기 (현장 네트워크 상황을 고려하여 최대 1.5초 대기)
+                    int wait = 0;
+                    while (realId == 0xFFFFFFFF && wait < 15) { await Task.Delay(100); wait++; }
 
                     if (realId == 0xFFFFFFFF)
                     {
-                        _logger.Warning($"[Service] {ip} 장비가 Who-Is 응답을 주지 않아 수집을 포기합니다.");
+                        _logger.Warning($"[Service] {ip} 장비의 진짜 ID를 찾지 못했습니다. 수집을 건너뜁니다.");
                         return resultList;
                     }
 
-                    _logger.Info($"[Service] {ip} 진짜 ID 확인됨: {realId}. 포인트 리스트를 조회합니다.");
+                    _logger.Info($"[Service] {ip} 리얼 ID({realId}) 확인. 포인트 리스트를 조회합니다.");
 
-                    // 3단계: 이제 "IP(아파트 주소)"와 "리얼 ID(호수)"를 조합해서 정확히 찌릅니다.
-                    // 이 리얼 ID가 정확해야만 장비가 "아, 내 데이터를 달라는 거구나" 하고 Object_List를 내놓습니다.
+                    // [2단계] 진짜 ID를 사용하여 장비 내부의 모든 객체 목록(Object_List)을 조회합니다.
                     var deviceOid = new BacnetObjectId(BacnetObjectTypes.OBJECT_DEVICE, realId);
                     IList<BacnetValue> listCount;
-
-                    // 0번 인덱스로 전체 포인트가 몇 개인지 묻습니다.
                     if (!client.ReadPropertyRequest(addr, deviceOid, BacnetPropertyIds.PROP_OBJECT_LIST, out listCount, 0, 0))
                     {
                         _logger.Error($"[Service] {ip}(ID:{realId}) 포인트 개수 조회 실패.");
@@ -95,9 +88,9 @@ namespace BacnetInventoryScanner.Service
                     }
 
                     int count = Convert.ToInt32(listCount[0].Value);
-                    _logger.Info($"[Service] {ip} 장비에서 {count}개의 객체를 발견했습니다.");
+                    _logger.Info($"[Service] {ip}에서 총 {count}개의 객체 감지. 상세 수집을 시작합니다.");
 
-                    // 3. [상세 수집] 루프를 돌며 개별 포인트의 이름, 설명, 타입을 가져옵니다.
+                    // [3단계] 감지된 모든 객체를 루프 돌며 상세 속성을 수집 및 정제합니다.
                     for (int i = 1; i <= count; i++)
                     {
                         IList<BacnetValue> objIdVal;
@@ -105,19 +98,24 @@ namespace BacnetInventoryScanner.Service
                         {
                             var oid = (BacnetObjectId)objIdVal[0].Value;
 
-                            // 우리가 관리하는 대상(AI~MSV)만 딕셔너리에 담습니다.
+                            // SI 수집 대상 타입(AI~MSV)만 처리합니다.
                             if (SiMapping.ContainsKey(oid.Type))
                             {
                                 var ptData = new Dictionary<string, object>();
                                 var map = SiMapping[oid.Type];
 
+                                // [데이터 수집] 깨진 글자 감지 로직(SanitizeData)을 즉각 적용합니다.
                                 ptData["SYSTEM_PT_ID"] = $"{map.Prefix}-{oid.Instance}";
-                                ptData["OBJ_NAME"] = ReadProp(client, addr, oid, BacnetPropertyIds.PROP_OBJECT_NAME);
-                                ptData["OBJ_DESC"] = ReadProp(client, addr, oid, BacnetPropertyIds.PROP_DESCRIPTION);
+                                ptData["OBJ_NAME"] = SanitizeData(ReadProp(client, addr, oid, BacnetPropertyIds.PROP_OBJECT_NAME));
+                                ptData["OBJ_DESC"] = SanitizeData(ReadProp(client, addr, oid, BacnetPropertyIds.PROP_DESCRIPTION));
                                 ptData["OBJ_TYPE"] = map.TypeId;
                                 ptData["OBJ_DECIMAL"] = (map.TypeId <= 2) ? 1 : 0;
 
-                                // MSI, MSO, MSV인 경우 '가동/정지' 같은 상태 이름을 10개까지 가져옵니다.
+                                // [단위 수집] 95 무시 및 CMH, mmAq 기호 변환 적용
+                                string unitRaw = ReadProp(client, addr, oid, BacnetPropertyIds.PROP_UNITS);
+                                ptData["OBJ_UNIT"] = MapUnitSymbol(unitRaw);
+
+                                // [상태값 수집] MSO 등 멀티스테이트 포인트의 상태 리스트 1~10 수집
                                 if (map.TypeId >= 6 && map.TypeId <= 8)
                                 {
                                     IList<BacnetValue> states;
@@ -125,7 +123,9 @@ namespace BacnetInventoryScanner.Service
                                     {
                                         for (int s = 0; s < 10; s++)
                                         {
-                                            ptData[$"OBJ_STATUS{s + 1}"] = (s < states.Count) ? states[s].Value.ToString() : "";
+                                            string statusText = (s < states.Count) ? states[s].Value.ToString() : "";
+                                            // 상태값도 깨졌다면 빈칸으로 처리하여 데이터 품질을 유지합니다.
+                                            ptData[$"OBJ_STATUS{s + 1}"] = SanitizeData(statusText);
                                         }
                                     }
                                 }
@@ -134,12 +134,55 @@ namespace BacnetInventoryScanner.Service
                         }
                     }
                 }
-                catch (Exception ex) { _logger.Error($"[Service] {ip} 처리 중 오류", ex); }
+                catch (Exception ex) { _logger.Error($"[Service] {ip} Harvest 도중 치명적 오류 발생", ex); }
             }
+
+            _logger.Info($"[Service] {ip} 수집 완료. 유효 포인트: {resultList.Count}건");
             return resultList;
         }
 
-        // 특정 속성값을 안전하게 읽어오기 위한 헬퍼 함수입니다.
+        /// <summary>
+        /// 데이터 품질 정화: 유니코드 대체 문자(\uFFFD)나 제어 문자가 포함되면 아예 비웁니다.
+        /// </summary>
+        private string SanitizeData(string input)
+        {
+            if (string.IsNullOrEmpty(input)) return "";
+
+            // 1. 유니코드 대체 문자()가 포함되어 있다면 해석 실패 데이터이므로 무조건 비웁니다.
+            if (input.Contains("\uFFFD")) return "";
+
+            // 2. 아스키 제어 문자(0~31번)를 제거하고 공백을 다듬습니다.
+            string clean = Regex.Replace(input, @"[\x00-\x1F]", "").Trim();
+
+            return clean;
+        }
+
+        /// <summary>
+        /// BACnet 표준 단위 인덱스를 현장용 단위 기호로 번역합니다.
+        /// </summary>
+        private string MapUnitSymbol(string code)
+        {
+            if (string.IsNullOrEmpty(code) || code == "95") return ""; // 95: 단위없음(No Units)
+
+            switch (code)
+            {
+                case "62": return "℃";      // Degrees Celsius
+                case "98": return "%";       // Percent
+                case "135": return "CMH";    // Cubic Meters per Hour (m³/h)
+                case "206": return "mmAq";   // Millimeters of Water (mmH2O)
+                case "27": return "Hz";      // Hertz
+                case "48": return "kW";      // Kilowatts
+                case "19": return "kWh";     // Kilowatt-hours
+                case "53": return "Pa";      // Pascals
+                case "54": return "kPa";     // Kilopascals
+                case "111": return "rpm";    // Revolutions per minute
+                default: return code;        // 그 외 코드는 분석용으로 숫자 유지
+            }
+        }
+
+        /// <summary>
+        /// 속성을 안전하게 읽어오는 헬퍼 함수입니다.
+        /// </summary>
         private string ReadProp(BacnetClient c, BacnetAddress a, BacnetObjectId o, BacnetPropertyIds p)
         {
             try
@@ -152,33 +195,44 @@ namespace BacnetInventoryScanner.Service
         }
 
         /// <summary>
-        /// 수집된 데이터를 SI 클라이언트 업로드용 표준 22개 컬럼 CSV 형식으로 저장합니다.
+        /// 수집된 데이터를 SI 표준 CSV로 저장합니다. 한국어 엑셀 호환을 위해 CP949를 사용합니다.
         /// </summary>
         public void ExportToSiCsv(string filePath, List<Dictionary<string, object>> points, int deviceSeq, int deviceId)
         {
             var sb = new StringBuilder();
-            var headers = new[] { "SYSTEM_PT_ID", "OBJ_NAME", "OBJ_DESC", "OBJ_TYPE", "DEVICE_SEQ", "DEVICE_ID", "OBJ_DECIMAL", "OBJ_STATUS1", "OBJ_STATUS2", "OBJ_STATUS3", "OBJ_STATUS4", "OBJ_STATUS5", "OBJ_STATUS6", "OBJ_STATUS7", "OBJ_STATUS8", "OBJ_STATUS9", "OBJ_STATUS10", "DATETIME" };
+            // SI 시스템의 P_OBJECT 테이블 컬럼 스키마와 완벽히 일치시킵니다.
+            var headers = new[] { "SYSTEM_PT_ID", "OBJ_NAME", "OBJ_DESC", "OBJ_TYPE", "DEVICE_SEQ", "DEVICE_ID", "OBJ_DECIMAL", "OBJ_NUMBER", "ROUND_YN", "OBJ_IMPORTANCE", "OBJ_SECURITY", "OBJ_UNIT", "OBJ_STATUS1", "OBJ_STATUS2", "OBJ_STATUS3", "OBJ_STATUS4", "OBJ_STATUS5", "OBJ_STATUS6", "OBJ_STATUS7", "OBJ_STATUS8", "OBJ_STATUS9", "OBJ_STATUS10", "DATETIME" };
             sb.AppendLine(string.Join(",", headers));
 
             foreach (var pt in points)
             {
                 var row = new List<string>();
                 row.Add(pt["SYSTEM_PT_ID"].ToString());
+                // 데이터 내부에 콤마(,)가 포함되어 문서가 깨지는 것을 방지하기 위해 모든 텍스트를 따옴표로 감쌉니다.
                 row.Add($"\"{pt["OBJ_NAME"]}\"");
                 row.Add($"\"{pt["OBJ_DESC"]}\"");
                 row.Add(pt["OBJ_TYPE"].ToString());
                 row.Add(deviceSeq.ToString());
                 row.Add(deviceId.ToString());
                 row.Add(pt["OBJ_DECIMAL"].ToString());
+
+                // SI 시스템 기본값들
+                row.Add("0"); row.Add("false"); row.Add("false"); row.Add("254");
+
+                // 단위 및 상태값 10개 배치
+                row.Add(pt.ContainsKey("OBJ_UNIT") ? $"\"{pt["OBJ_UNIT"]}\"" : "\"\"");
                 for (int s = 1; s <= 10; s++)
                 {
                     string key = $"OBJ_STATUS{s}";
                     row.Add(pt.ContainsKey(key) ? $"\"{pt[key]}\"" : "\"\"");
                 }
+
                 row.Add(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
                 sb.AppendLine(string.Join(",", row));
             }
-            File.WriteAllText(filePath, sb.ToString(), Encoding.UTF8);
+
+            // ⭐ 엑셀에서 한글이 절대 깨지지 않도록 CP949(한국어 ANSI) 인코딩으로 저장합니다.
+            File.WriteAllText(filePath, sb.ToString(), Encoding.GetEncoding(949));
         }
     }
 }
