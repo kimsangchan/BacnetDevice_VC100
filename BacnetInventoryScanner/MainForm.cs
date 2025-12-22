@@ -136,7 +136,7 @@ namespace BacnetInventoryScanner
         {
             if (_isScanning) return;
             _isScanning = true;
-            btnStartScan.Text = "전수 조사 중...";
+            btnStartScan.Text = "고속 스캔 중...";
 
             try
             {
@@ -148,30 +148,26 @@ namespace BacnetInventoryScanner
                 await Task.Run(() => {
                     var ipList = Enumerable.Range(1, 254).Select(i => $"172.16.130.{i}").ToList();
 
-                    Parallel.ForEach(ipList, new ParallelOptions { MaxDegreeOfParallelism = 15 }, (ip) => {
+                    // [속도 최적화] 병렬 처리 수준을 50으로 상향
+                    Parallel.ForEach(ipList, new ParallelOptions { MaxDegreeOfParallelism = 50 }, (ip) => {
+                        // DirectScanDevice 내부 타임아웃이 짧아야 속도가 납니다.
                         var res = _inventoryService.DirectScanDevice(ip).Result;
 
                         if (res.DeviceId != 0xFFFFFFFF)
                         {
-                            // 장비 상세 정보(벤더, 모델, 객체이름)를 한 번에 가져옵니다.
                             var info = _inventoryService.GetDeviceInfo(res.Ip, res.DeviceId).Result;
                             string vName = info["Vendor"];
-                            string mName = info["Model"];
-                            string oName = info["DeviceName"]; // Object_Name
 
                             if (registeredIps.Contains(ip))
                             {
                                 var device = _siDevices.FirstOrDefault(d => d.DeviceIp == ip);
                                 if (device != null) device.IsOnline = true;
-
-                                // [수정] 벤더, 모델, 객체이름까지 상세 로그 출력
-                                _logger.Info($"[Online] {ip} (ID:{res.DeviceId}) 확인 | Vendor: {vName} | Model: {mName} | Name: {oName}");
+                                _logger.Info($"[Online] {ip} (ID:{res.DeviceId}) | {info["Model"]} | {info["DeviceName"]}");
                             }
                             else if (vName.IndexOf("Tridium", StringComparison.OrdinalIgnoreCase) >= 0)
                             {
                                 newDevicesBag.Add(res);
-                                // [수정] 미등록 장비도 상세 정보 출력
-                                _logger.Warning($"[New] 미등록 Tridium 발견: {ip} (ID:{res.DeviceId}) | Model: {mName} | Name: {oName}");
+                                _logger.Warning($"[New] {ip} 발견 (Tridium)");
                             }
                         }
                     });
@@ -179,53 +175,43 @@ namespace BacnetInventoryScanner
 
                 this.Invoke(new Action(() => { dataGridView1.Refresh(); }));
                 _unregisteredDevices = newDevicesBag.ToList();
-
-                MessageBox.Show($"스캔 완료!\nTridium 장비의 상세 정보(모델/객체명) 검증을 마쳤습니다.");
+                MessageBox.Show("고속 스캔 완료");
             }
-            finally
-            {
-                _isScanning = false;
-                btnStartScan.Text = "네트워크 스캔";
-            }
+            finally { _isScanning = false; btnStartScan.Text = "네트워크 스캔"; }
         }
-        // MainForm.cs 내부의 수출 버튼 이벤트
-        // MainForm.cs 내부의 포인트 추출 버튼 로직 업데이트
+
         private async void btnExport_Click(object sender, EventArgs e)
         {
+            string masterPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "SI_MASTER");
             var onlineDevices = _siDevices.FindAll(d => d.IsOnline);
+
             if (onlineDevices.Count == 0) return;
 
             btnExport.Enabled = false;
-            btnExport.Text = "수집 중...";
+            btnExport.Text = "델타 추출 중...";
 
             try
             {
-                var service = new BacnetInventoryScanner.Service.BacnetInventoryService(_logger);
-
                 await Task.Run(async () => {
-                    string exportPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports");
-                    if (!Directory.Exists(exportPath)) Directory.CreateDirectory(exportPath);
+                    var files = Directory.GetFiles(masterPath, "*.csv");
 
                     foreach (var dev in onlineDevices)
                     {
-                        _logger.Info($"[UI] {dev.CodeName} 포인트 추출 시도...");
+                        // 유연한 파일 매핑 (Seq 포함 파일 찾기)
+                        string foundMaster = files.FirstOrDefault(f => Path.GetFileName(f).Contains(dev.FixCodeNo));
 
-                        // [수정] 인자를 IP 하나만 전달하도록 변경 (CS1501 해결)
-                        var points = await service.HarvestPoints(dev.DeviceIp);
-
-                        string filePath = Path.Combine(exportPath, $"S-{dev.FixCodeNo}-{dev.CodeName}.csv");
-                        service.ExportToSiCsv(filePath, points, int.Parse(dev.FixCodeNo), dev.DeviceId);
-
-                        _logger.Info($"[UI] {dev.CodeName} 파일 생성 완료: {filePath}");
+                        if (!string.IsNullOrEmpty(foundMaster))
+                        {
+                            var points = await _inventoryService.HarvestPoints(dev.DeviceIp);
+                            if (points != null)
+                            {
+                                // [변경] 기존 파일에 붙이지 않고 '새로운 델타 전용 파일' 생성
+                                _inventoryService.ExportDeltaOnly(foundMaster, points, dev.DeviceId, int.Parse(dev.FixCodeNo));
+                            }
+                        }
                     }
                 });
-
-                MessageBox.Show("수출 완료!");
-                System.Diagnostics.Process.Start("explorer.exe", Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports"));
-            }
-            catch (Exception ex)
-            {
-                _logger.Error("에러 발생", ex);
+                MessageBox.Show("신규 포인트(Delta) 추출이 완료되었습니다.\nSI_DELTA_ONLY 폴더를 확인하세요.");
             }
             finally
             {

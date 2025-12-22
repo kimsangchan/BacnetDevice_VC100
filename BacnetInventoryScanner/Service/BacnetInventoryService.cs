@@ -301,5 +301,121 @@ namespace BacnetInventoryScanner.Service
             }
             return (ip, foundId);
         }
+        // [최종] UTF-8 인코딩 및 메모리 DTO 기반 병합 로직
+        /// <summary>
+        /// [최종] deviceSeq가 일치하는 마스터 파일 내에서 SYSTEM_PT_ID 중복 체크 후 증분 추가 (UTF-8)
+        /// </summary>
+        public void MergeToSiMaster(string filePath, List<Dictionary<string, object>> scannedPoints, int deviceId, int deviceSeq)
+        {
+            // [보완] 파일이 없으면 여기서도 중단 (MainForm에서 체크하지만 2중 안전장치)
+            if (!File.Exists(filePath))
+            {
+                _logger.Warning($"[중단] 마스터 파일 없음: {Path.GetFileName(filePath)}");
+                return;
+            }
+
+            try
+            {
+                HashSet<string> existingPtIds = new HashSet<string>();
+
+                // UTF-8로 기존 포인트 ID 수집
+                var lines = File.ReadAllLines(filePath, Encoding.UTF8);
+                foreach (var line in lines.Skip(1))
+                {
+                    var cols = line.Split(',');
+                    if (cols.Length > 5 && cols[4].Trim() == deviceSeq.ToString())
+                    {
+                        existingPtIds.Add(cols[5].Trim());
+                    }
+                }
+
+                // 중복 제외 신규 포인트 선별
+                var newPoints = scannedPoints.Where(p => !existingPtIds.Contains(p["SYSTEM_PT_ID"].ToString())).ToList();
+                if (newPoints.Count == 0) return;
+
+                StringBuilder sb = new StringBuilder();
+                foreach (var pt in newPoints)
+                {
+                    int type = Convert.ToInt32(pt["OBJ_TYPE"]);
+                    var row = new List<string> {
+                "1", "0", deviceId.ToString(), type.ToString(), deviceSeq.ToString(), pt["SYSTEM_PT_ID"].ToString(),
+                $"\"{pt["OBJ_NAME"]}\"", pt.ContainsKey("OBJ_UNIT") ? $"\"{pt["OBJ_UNIT"]}\"" : "", pt["OBJ_DECIMAL"].ToString(), "0", "False", $"\"{pt["OBJ_DESC"]}\""
+            };
+                    for (int s = 1; s <= 10; s++) row.Add(pt.ContainsKey($"OBJ_STATUS{s}") ? $"\"{pt[$"OBJ_STATUS{s}"]}\"" : "");
+                    row.AddRange(new[] { "0", "0", (type <= 2 ? "100000" : "1"), (type <= 2 ? "-100000" : "-1"), "False", "", "/0", "", "False", "", "", "", "254", "False", "" });
+
+                    sb.AppendLine(string.Join(",", row));
+                }
+
+                // 기존 파일 끝에 UTF-8로 추가
+                File.AppendAllText(filePath, sb.ToString(), Encoding.UTF8);
+                _logger.Info($"[병합성공] {Path.GetFileName(filePath)}: +{newPoints.Count}건");
+            }
+            catch (Exception ex) { _logger.Error($"병합 실패 (Seq:{deviceSeq})", ex); }
+        }
+        // [최종] 콤마 방지 + UTF-8 BOM + 순수 델타 파일 생성 로직
+        public void ExportDeltaOnly(string masterFilePath, List<Dictionary<string, object>> scannedPoints, int deviceId, int deviceSeq)
+        {
+            try
+            {
+                HashSet<string> existingIds = new HashSet<string>();
+                if (File.Exists(masterFilePath))
+                {
+                    // 한글 깨짐 방지를 위해 BOM 대응 UTF-8로 읽기
+                    var lines = File.ReadAllLines(masterFilePath, Encoding.UTF8);
+                    foreach (var line in lines.Skip(1))
+                    {
+                        var cols = line.Split(',');
+                        if (cols.Length > 5) existingIds.Add(cols[5].Trim().Replace("\"", ""));
+                    }
+                }
+
+                var delta = scannedPoints.Where(p => !existingIds.Contains(p["SYSTEM_PT_ID"].ToString())).ToList();
+                if (delta.Count == 0) return;
+
+                string outDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "SI_DELTA_ONLY");
+                if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
+                string outPath = Path.Combine(outDir, $"Add-{deviceSeq}-{deviceId}.csv");
+
+                // ⭐ [중요] UTF-8 with BOM 설정 (new UTF8Encoding(true))
+                using (var sw = new StreamWriter(outPath, false, new UTF8Encoding(true)))
+                {
+                    sw.WriteLine("SERVER_ID,SYSTEM_ID,DEVICE_ID,OBJ_TYPE,DEVICE_SEQ,SYSTEM_PT_ID,OBJ_NAME,OBJ_UNIT_NUM,OBJ_DECIMAL,OBJ_NUMBER,ROUND_YN,OBJ_DESC,OBJ_STATUS1,OBJ_STATUS2,OBJ_STATUS3,OBJ_STATUS4,OBJ_STATUS5,OBJ_STATUS6,OBJ_STATUS7,OBJ_STATUS8,OBJ_STATUS9,OBJ_STATUS10,ALARM_LV,DEADBAND,OBJ_ABOVE,OBJ_BELOW,OBJ_IMPORTANCE,OBJ_TREND_CYCLE,OBJ_ALARM_PAGE,OBJ_ALARM_MSG,OBJ_FMS,FMS_NAME,FMS_START_DATA,FMS_UPDATA_CYCLE,OBJ_SECURITY,OBJ_PDA,OBJ_NOTE");
+
+                    foreach (var pt in delta)
+                    {
+                        int type = Convert.ToInt32(pt["OBJ_TYPE"]);
+
+                        // ⭐ [해결] 모든 콤마(,)를 제거하여 37개 컬럼 규격 강제 준수
+                        var row = new List<string> {
+                    "1", "0", deviceId.ToString(), type.ToString(), deviceSeq.ToString(),
+                    Clean(pt["SYSTEM_PT_ID"]),
+                    Clean(pt["OBJ_NAME"]),
+                    pt.ContainsKey("OBJ_UNIT") ? Clean(pt["OBJ_UNIT"]) : "",
+                    pt["OBJ_DECIMAL"].ToString(), "0", "False",
+                    Clean(pt["OBJ_DESC"]) // "C,D ZONE"이 "C D ZONE"으로 변경됨
+                };
+                        for (int s = 1; s <= 10; s++) row.Add("");
+                        row.AddRange(new[] { "0", "0", (type <= 2 ? "100000" : "1"), (type <= 2 ? "-100000" : "-1"), "False", "", "/0", "", "False", "", "", "", "254", "False", "" });
+
+                        sw.WriteLine(string.Join(",", row));
+                    }
+                }
+                _logger.Info($"[델타생성성공] {Path.GetFileName(outPath)}");
+            }
+            catch (Exception ex) { _logger.Error("CSV 생성 실패", ex); }
+        }
+
+        // ⭐ [해결] 데이터 내의 콤마(,)를 제거하고 따옴표를 정제하는 함수
+        private string Clean(object val)
+        {
+            if (val == null) return "";
+            string s = val.ToString();
+            // 데이터 내 콤마는 공백으로 치환 (컬럼 밀림 방지)
+            s = s.Replace(",", " ");
+            // 줄바꿈 제거 및 따옴표 정제
+            s = s.Replace("\r", "").Replace("\n", "").Replace("\"", "");
+            return s;
+        }
     }
 }
