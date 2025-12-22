@@ -10,6 +10,7 @@ using System.Text;
 using System.IO;
 using System.Linq;
 using BacnetInventoryScanner.Service;
+using System.Collections.Concurrent;
 
 namespace BacnetInventoryScanner
 {
@@ -18,15 +19,21 @@ namespace BacnetInventoryScanner
         private Button btnLoadDeviceList;
         private Button btnStartScan;
         private Button btnExport;
+
         private DataGridView dataGridView1;
         private List<SiDeviceInfo> _siDevices = new List<SiDeviceInfo>();
+        private List<(string Ip, uint DeviceId)> _unregisteredDevices = new List<(string Ip, uint DeviceId)>();
 
+        private BacnetInventoryService _inventoryService;
         // 날짜별 로그 생성을 위한 로거 (DeviceSeq 대신 0 또는 특정 ID 사용)
         private BacnetLogger _logger = new BacnetLogger(99999, LogLevel.INFO);
+        private bool _isScanning;
 
         public MainForm()
         {
             InitializeComponent();
+            // ⭐ [추가] 서비스 초기화
+            _inventoryService = new BacnetInventoryService(_logger);
             this.Size = new Size(1000, 700);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.Text = "BACnet Inventory Manager (Toss Style)";
@@ -127,75 +134,57 @@ namespace BacnetInventoryScanner
         // MainForm.cs 내부 수정
         private async void btnStartScan_Click(object sender, EventArgs e)
         {
-            if (_siDevices == null || _siDevices.Count == 0)
-            {
-                _logger.Warning("스캔 시도 실패: 로드된 장비 없음");
-                MessageBox.Show("먼저 [장비 목록 로드]를 실행해 주세요.");
-                return;
-            }
-
-            btnStartScan.Enabled = false;
-            btnStartScan.Text = "스캔 중...";
-            _logger.Info($"--- 실전 BACnet 스캔 시작: 대상 {_siDevices.Count}대 ---");
+            if (_isScanning) return;
+            _isScanning = true;
+            btnStartScan.Text = "전수 조사 중...";
 
             try
             {
-                // 고속 스캔을 위해 10개씩 병렬 처리
-                await Task.Run(async () => {
-                    // Niagara Station과 충돌을 피하기 위해 임시 포트 사용
-                    using (var udp = new System.Net.Sockets.UdpClient(0))
-                    {
-                        udp.Client.ReceiveTimeout = 1000; // 응답 대기 시간 1초
+                var registeredIps = new HashSet<string>(_siDevices.Select(d => d.DeviceIp));
+                var newDevicesBag = new System.Collections.Concurrent.ConcurrentBag<(string Ip, uint DeviceId)>();
 
-                        // Who-Is 표준 패킷 (Unicast용)
-                        byte[] whoIsPayload = new byte[] { 0x81, 0x0a, 0x00, 0x0c, 0x01, 0x20, 0xff, 0xff, 0x00, 0xff, 0x10, 0x08 };
+                foreach (var d in _siDevices) d.IsOnline = false;
 
-                        foreach (var dev in _siDevices)
+                await Task.Run(() => {
+                    var ipList = Enumerable.Range(1, 254).Select(i => $"172.16.130.{i}").ToList();
+
+                    Parallel.ForEach(ipList, new ParallelOptions { MaxDegreeOfParallelism = 15 }, (ip) => {
+                        var res = _inventoryService.DirectScanDevice(ip).Result;
+
+                        if (res.DeviceId != 0xFFFFFFFF)
                         {
-                            try
+                            // 장비 상세 정보(벤더, 모델, 객체이름)를 한 번에 가져옵니다.
+                            var info = _inventoryService.GetDeviceInfo(res.Ip, res.DeviceId).Result;
+                            string vName = info["Vendor"];
+                            string mName = info["Model"];
+                            string oName = info["DeviceName"]; // Object_Name
+
+                            if (registeredIps.Contains(ip))
                             {
-                                _logger.Info($"[Scan] {dev.CodeName} ({dev.DeviceIp}) 시도 중...");
+                                var device = _siDevices.FirstOrDefault(d => d.DeviceIp == ip);
+                                if (device != null) device.IsOnline = true;
 
-                                var remoteEP = new System.Net.IPEndPoint(System.Net.IPAddress.Parse(dev.DeviceIp), 47808);
-                                await udp.SendAsync(whoIsPayload, whoIsPayload.Length, remoteEP);
-
-                                // 응답 확인 (비동기 수신)
-                                var receiveTask = udp.ReceiveAsync();
-                                if (await Task.WhenAny(receiveTask, Task.Delay(800)) == receiveTask)
-                                {
-                                    var result = receiveTask.Result;
-                                    if (result.Buffer.Length > 0)
-                                    {
-                                        dev.IsOnline = true; // 대답이 오면 온라인!
-                                        _logger.Info($"[Success] {dev.DeviceIp} 응답 확인 완료");
-                                    }
-                                }
-                                else
-                                {
-                                    dev.IsOnline = false;
-                                    _logger.Warning($"[Fail] {dev.DeviceIp} 응답 없음 (Timeout)");
-                                }
+                                // [수정] 벤더, 모델, 객체이름까지 상세 로그 출력
+                                _logger.Info($"[Online] {ip} (ID:{res.DeviceId}) 확인 | Vendor: {vName} | Model: {mName} | Name: {oName}");
                             }
-                            catch (Exception ex)
+                            else if (vName.IndexOf("Tridium", StringComparison.OrdinalIgnoreCase) >= 0)
                             {
-                                _logger.Error($"[Error] {dev.DeviceIp} 스캔 중 오류", ex);
+                                newDevicesBag.Add(res);
+                                // [수정] 미등록 장비도 상세 정보 출력
+                                _logger.Warning($"[New] 미등록 Tridium 발견: {ip} (ID:{res.DeviceId}) | Model: {mName} | Name: {oName}");
                             }
                         }
-                    }
+                    });
                 });
 
-                // UI 갱신 (온라인인 장비는 그리드에서 확인 가능)
-                dataGridView1.Refresh();
-                _logger.Info("--- 실전 스캔 완료 ---");
-                MessageBox.Show("스캔이 완료되었습니다. 응답이 있는 장비를 확인하세요.");
-            }
-            catch (Exception ex)
-            {
-                _logger.Error("전체 스캔 루프 치명적 에러", ex);
+                this.Invoke(new Action(() => { dataGridView1.Refresh(); }));
+                _unregisteredDevices = newDevicesBag.ToList();
+
+                MessageBox.Show($"스캔 완료!\nTridium 장비의 상세 정보(모델/객체명) 검증을 마쳤습니다.");
             }
             finally
             {
-                btnStartScan.Enabled = true;
+                _isScanning = false;
                 btnStartScan.Text = "네트워크 스캔";
             }
         }

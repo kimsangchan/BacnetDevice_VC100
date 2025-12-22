@@ -234,5 +234,72 @@ namespace BacnetInventoryScanner.Service
             // ⭐ 엑셀에서 한글이 절대 깨지지 않도록 CP949(한국어 ANSI) 인코딩으로 저장합니다.
             File.WriteAllText(filePath, sb.ToString(), Encoding.GetEncoding(949));
         }
+
+        // 장비 정체 파악을 위한 제조사 및 모델명 조회
+        // [출처: image_137195.png의 Vendor/Model 정보를 가져오기 위한 핵심 메서드]
+        // 장비 정체(Vendor) 확인 메서드
+        // 장비의 벤더, 모델, 객체이름(Station Name)을 수집합니다.
+        public async Task<Dictionary<string, string>> GetDeviceInfo(string ip, uint deviceId)
+        {
+            var info = new Dictionary<string, string> {
+        { "Vendor", "Unknown" },
+        { "Model", "Unknown" },
+        { "DeviceName", "Unknown" }
+    };
+
+            using (var client = new BacnetClient(new BacnetIpUdpProtocolTransport(0, false)))
+            {
+                try
+                {
+                    client.Start();
+                    var addr = new BacnetAddress(BacnetAddressTypes.IP, ip + ":47808");
+                    var oid = new BacnetObjectId(BacnetObjectTypes.OBJECT_DEVICE, deviceId);
+
+                    // 1. Vendor_Name (121)
+                    info["Vendor"] = ReadProp(client, addr, oid, BacnetPropertyIds.PROP_VENDOR_NAME);
+                    // 2. Model_Name (70)
+                    info["Model"] = ReadProp(client, addr, oid, BacnetPropertyIds.PROP_MODEL_NAME);
+                    // 3. Object_Name (77) - 현장의 Station 명칭
+                    info["DeviceName"] = ReadProp(client, addr, oid, BacnetPropertyIds.PROP_OBJECT_NAME);
+                }
+                catch { }
+            }
+            return info;
+        }
+
+        /// <summary>
+        /// [추가] 특정 IP로 Who-Is 패킷을 보내 장비의 존재 여부와 ID를 확인합니다.
+        /// </summary>
+        public async Task<(string Ip, uint DeviceId)> DirectScanDevice(string ip)
+        {
+            uint foundId = 0xFFFFFFFF; // 기본값: 찾지 못함
+
+            // 포트 0은 OS가 할당하는 임의의 포트를 의미합니다.
+            using (var client = new BacnetClient(new BacnetIpUdpProtocolTransport(0, false)))
+            {
+                try
+                {
+                    client.Start();
+                    var addr = new BacnetAddress(BacnetAddressTypes.IP, ip + ":47808");
+
+                    // I-Am 응답이 오면 ID를 기록합니다.
+                    client.OnIam += (c, adr, device_id, max_apdu, segmentation, vendor_id) => {
+                        if (adr.ToString().Contains(ip)) foundId = device_id;
+                    };
+
+                    client.WhoIs(0, -1, addr); // 유니캐스트 Who-Is 송신
+
+                    // 응답 대기 (최대 0.8초)
+                    int wait = 0;
+                    while (foundId == 0xFFFFFFFF && wait < 8)
+                    {
+                        await Task.Delay(100);
+                        wait++;
+                    }
+                }
+                catch { /* 스캔 중 통신 에러는 무시하고 다음 IP로 진행 */ }
+            }
+            return (ip, foundId);
+        }
     }
 }
