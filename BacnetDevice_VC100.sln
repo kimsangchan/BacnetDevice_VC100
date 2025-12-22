@@ -7,6 +7,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BacnetDevice_VC100", "Bacne
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BacnetDevice_VC100.Test", "BacnetDevice_VC100.Test\BacnetDevice_VC100.Test.csproj", "{8BBC251B-9AB6-48AC-A8D9-FD3B8B669A0A}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BacnetInventoryApp", "BacnetInventoryApp\BacnetInventoryApp.csproj", "{9864C689-A563-44D4-A833-5034F1D13BA5}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BacnetInventoryScanner", "BacnetInventoryScanner\BacnetInventoryScanner.csproj", "{D5AB2CFD-FF60-4441-915E-5A1006FF93E0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -21,6 +25,14 @@ Global
 		{8BBC251B-9AB6-48AC-A8D9-FD3B8B669A0A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{8BBC251B-9AB6-48AC-A8D9-FD3B8B669A0A}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{8BBC251B-9AB6-48AC-A8D9-FD3B8B669A0A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9864C689-A563-44D4-A833-5034F1D13BA5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9864C689-A563-44D4-A833-5034F1D13BA5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9864C689-A563-44D4-A833-5034F1D13BA5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9864C689-A563-44D4-A833-5034F1D13BA5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D5AB2CFD-FF60-4441-915E-5A1006FF93E0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D5AB2CFD-FF60-4441-915E-5A1006FF93E0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D5AB2CFD-FF60-4441-915E-5A1006FF93E0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D5AB2CFD-FF60-4441-915E-5A1006FF93E0}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
