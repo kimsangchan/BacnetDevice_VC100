@@ -16,9 +16,13 @@ namespace BacnetInventoryScanner
 {
     public partial class MainForm : Form
     {
+        // ==========================================
+        // [1] 필드 선언부 (클래스 상단 변수 있는 곳)
+        // ==========================================
         private Button btnLoadDeviceList;
         private Button btnStartScan;
         private Button btnExport;
+        private Button btnCheckHistory;
 
         private DataGridView dataGridView1;
         private List<SiDeviceInfo> _siDevices = new List<SiDeviceInfo>();
@@ -31,6 +35,10 @@ namespace BacnetInventoryScanner
 
         public MainForm()
         {
+            // ==========================================
+            // [2] 생성자 내부 (UI 속성 및 이벤트 연결)
+            // InitializeComponent(); 바로 아래에 넣으세요.
+            // ==========================================
             InitializeComponent();
             // ⭐ [추가] 서비스 초기화
             _inventoryService = new BacnetInventoryService(_logger);
@@ -50,15 +58,20 @@ namespace BacnetInventoryScanner
             btnLoadDeviceList = CreateTossButton("장비 목록 로드", Color.FromArgb(0, 100, 255), 0);
             btnStartScan = CreateTossButton("네트워크 스캔", Color.FromArgb(48, 199, 150), 170);
             btnExport = CreateTossButton("SI 포인트 생성", Color.FromArgb(107, 118, 132), 340);
+            btnCheckHistory = CreateTossButton("변경 이력", Color.FromArgb(255, 140, 0), 510);
 
+            // ⭐ [필수] 생성된 버튼에 클릭 이벤트 연결
+            
             // ⭐ [필수] 클릭 이벤트 연결 (기존에 빠져있던 부분)
             btnLoadDeviceList.Click += btnLoadDeviceList_Click;
             btnStartScan.Click += btnStartScan_Click; // 이 줄이 있어야 버튼이 동작합니다.
             btnExport.Click += btnExport_Click; // 이 줄이 빠져있을 확률이 높습니다.
-
+            btnCheckHistory.Click += btnCheckHistory_Click
+                ;
             pnlHeader.Controls.Add(btnExport);
             pnlHeader.Controls.Add(btnStartScan);
             pnlHeader.Controls.Add(btnLoadDeviceList);
+            pnlHeader.Controls.Add(btnCheckHistory);
 
             dataGridView1 = new DataGridView
             {
@@ -73,6 +86,66 @@ namespace BacnetInventoryScanner
 
             this.Controls.Add(dataGridView1);
             this.Controls.Add(pnlHeader);
+        }
+
+        // [이벤트 핸들러] 변경사항 추적 로직 실행
+        // [이벤트] '변경 이력' 버튼 클릭 시 실행됨
+        private async void btnCheckHistory_Click(object sender, EventArgs e)
+        {
+            // 1. 온라인(통신 가능) 상태인 장비만 추려냄
+            var onlineDevices = _siDevices.FindAll(d => d.IsOnline);
+            if (onlineDevices.Count == 0)
+            {
+                MessageBox.Show("온라인 장비가 없습니다. 먼저 [네트워크 스캔]을 진행하세요.");
+                return;
+            }
+
+            // 2. UI 잠금 및 상태 표시
+            btnCheckHistory.Enabled = false;
+            btnCheckHistory.Text = "분석 중...";
+            _logger.Info("--- [Start] 변경 사항(History) 및 SQL 분석 시작 ---");
+
+            try
+            {
+                await Task.Run(async () => {
+                    // SI_MASTER 폴더 경로 확보
+                    string masterDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "SI_MASTER");
+                    // 폴더 내 모든 CSV 파일을 미리 읽어둠 (성능 최적화)
+                    var files = Directory.GetFiles(masterDir, "*.csv");
+
+                    foreach (var dev in onlineDevices)
+                    {
+                        // [로직] 파일명에 장비코드(FixCodeNo)가 포함된 마스터 파일을 찾음 (유연한 매핑)
+                        string masterFile = files.FirstOrDefault(f => Path.GetFileName(f).Contains(dev.FixCodeNo));
+
+                        if (!string.IsNullOrEmpty(masterFile))
+                        {
+                            // [통신] 장비에서 현재 포인트 리스트 수집
+                            var currentPoints = await _inventoryService.HarvestPoints(dev.DeviceIp);
+
+                            if (currentPoints != null)
+                            {
+                                // [핵심] 서비스 계층의 변경 감지 로직 호출 (Update/Delete/SQL 생성)
+                                _inventoryService.DetectChangesAndGenerateSql(masterFile, currentPoints, dev.DeviceId, int.Parse(dev.FixCodeNo));
+                            }
+                        }
+                    }
+                });
+
+                // 3. 완료 처리 및 폴더 열기
+                MessageBox.Show("분석 완료!\nExports\\HISTORY 폴더에 결과가 저장되었습니다.");
+                System.Diagnostics.Process.Start("explorer.exe", Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "HISTORY"));
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("히스토리 분석 중 치명적 오류 발생", ex);
+            }
+            finally
+            {
+                // UI 복구
+                btnCheckHistory.Enabled = true;
+                btnCheckHistory.Text = "변경 이력";
+            }
         }
 
         private Button CreateTossButton(string text, Color color, int left)

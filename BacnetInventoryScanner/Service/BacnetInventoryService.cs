@@ -375,7 +375,7 @@ namespace BacnetInventoryScanner.Service
 
                 string outDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "SI_DELTA_ONLY");
                 if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
-                string outPath = Path.Combine(outDir, $"Add-{deviceSeq}-{deviceId}.csv");
+                string outPath = Path.Combine(outDir, $"Add-S-{deviceSeq}-{deviceId}.csv");
 
                 // ⭐ [중요] UTF-8 with BOM 설정 (new UTF8Encoding(true))
                 using (var sw = new StreamWriter(outPath, false, new UTF8Encoding(true)))
@@ -417,5 +417,168 @@ namespace BacnetInventoryScanner.Service
             s = s.Replace("\r", "").Replace("\n", "").Replace("\"", "");
             return s;
         }
+        // [기능] 마스터 파일과 현재 스캔 데이터를 비교하여 변경점(Update/Delete)을 찾고 P_OBJECT용 SQL 생성
+        // [기존 메서드 수정] DetectChangesAndGenerateSql
+        // [기능] 마스터 파일과 스캔 데이터를 비교하여 변경점(Update/Delete) 찾기
+        // [수정] 히스토리 CSV에 'OBJ_NAME' 컬럼을 추가하여 식별 용이성 강화
+        public void DetectChangesAndGenerateSql(string masterFilePath, List<Dictionary<string, object>> scannedPoints, int deviceId, int deviceSeq)
+        {
+            try
+            {
+                if (!File.Exists(masterFilePath)) return;
+
+                // 1. 인코딩 자동 감지 및 파일 로드 (한글 깨짐 방지)
+                Encoding detectedEncoding = GetEncoding(masterFilePath);
+                var lines = File.ReadAllLines(masterFilePath, detectedEncoding);
+
+                if (lines.Length < 1) return;
+
+                var headers = lines[0].Split(',');
+
+                // 컬럼 인덱스 매핑
+                int idxId = Array.IndexOf(headers, "SYSTEM_PT_ID");
+                int idxName = Array.IndexOf(headers, "OBJ_NAME");
+                int idxUnit = Array.IndexOf(headers, "OBJ_UNIT_NUM");
+                int idxDesc = Array.IndexOf(headers, "OBJ_DESC");
+                int idxDec = Array.IndexOf(headers, "OBJ_DECIMAL");
+                int idxType = Array.IndexOf(headers, "OBJ_TYPE");
+
+                var masterMap = new Dictionary<string, string[]>();
+
+                // 마스터 데이터 메모리 적재
+                foreach (var line in lines.Skip(1))
+                {
+                    var cols = line.Split(',');
+                    if (cols.Length > idxId && idxId >= 0)
+                    {
+                        string ptId = cols[idxId].Trim().Replace("\"", "");
+                        masterMap[ptId] = cols;
+                    }
+                }
+
+                // 2. 결과 저장 경로 설정
+                string histDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "HISTORY");
+                if (!Directory.Exists(histDir)) Directory.CreateDirectory(histDir);
+
+                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmm");
+                string histPath = Path.Combine(histDir, $"History_S-{deviceSeq}-{deviceId}_{timestamp}.csv");
+                string sqlPath = Path.Combine(histDir, $"Query_S-{deviceSeq}-{deviceId}_{timestamp}.sql");
+
+                StringBuilder sqlBuilder = new StringBuilder();
+                StringBuilder histBuilder = new StringBuilder();
+
+                // ⭐ [수정] 헤더에 OBJ_NAME 추가
+                histBuilder.AppendLine("TIMESTAMP,DEVICE_SEQ,SYSTEM_PT_ID,OBJ_NAME,ACTION,COLUMN,OLD_VALUE,NEW_VALUE");
+
+                bool hasChanges = false;
+
+                // 3. [Update 감지]
+                foreach (var scanPt in scannedPoints)
+                {
+                    string ptId = scanPt["SYSTEM_PT_ID"].ToString();
+
+                    if (masterMap.ContainsKey(ptId))
+                    {
+                        var masterCols = masterMap[ptId];
+
+                        // ⭐ 참조용 현재 이름 가져오기 (식별용)
+                        string currentObjName = scanPt.ContainsKey("OBJ_NAME") ? Clean(scanPt["OBJ_NAME"]) : "";
+
+                        var targets = new List<(int Idx, string Key, string ColName)>
+                {
+                    (idxName, "OBJ_NAME", "OBJ_NAME"),
+                    (idxDesc, "OBJ_DESC", "OBJ_DESC"),
+                    (idxUnit, "OBJ_UNIT", "OBJ_UNIT_NUM"),
+                    (idxDec, "OBJ_DECIMAL", "OBJ_DECIMAL"),
+                    (idxType, "OBJ_TYPE", "OBJ_TYPE")
+                };
+
+                        foreach (var t in targets)
+                        {
+                            if (t.Idx < 0) continue;
+
+                            // Clean() 적용하여 비교 (공백/따옴표 제거된 순수 값)
+                            string oldVal = Clean(masterCols[t.Idx]);
+                            string newVal = scanPt.ContainsKey(t.Key) ? Clean(scanPt[t.Key]) : "";
+
+                            if (oldVal != newVal)
+                            {
+                                hasChanges = true;
+
+                                // ⭐ [수정] 히스토리에 식별용 이름(currentObjName) 함께 기록
+                                histBuilder.AppendLine($"{DateTime.Now},{deviceSeq},{ptId},\"{currentObjName}\",UPDATE,{t.ColName},\"{oldVal}\",\"{newVal}\"");
+
+                                // SQL 생성
+                                string safeVal = newVal.Replace("'", "''");
+                                sqlBuilder.AppendLine($"UPDATE [dbo].[P_OBJECT] SET [{t.ColName}] = '{safeVal}' WHERE [DEVICE_SEQ] = {deviceSeq} AND [SYSTEM_PT_ID] = '{ptId}';");
+                            }
+                        }
+                        masterMap.Remove(ptId);
+                    }
+                }
+
+                // 4. [Delete 감지]
+                foreach (var kvp in masterMap)
+                {
+                    string deletedId = kvp.Key;
+                    string[] deletedCols = kvp.Value;
+
+                    // ⭐ 삭제된 포인트의 이름 가져오기 (마스터 파일 기준)
+                    string deletedObjName = (idxName >= 0 && deletedCols.Length > idxName) ? Clean(deletedCols[idxName]) : "Unknown";
+
+                    hasChanges = true;
+                    histBuilder.AppendLine($"{DateTime.Now},{deviceSeq},{deletedId},\"{deletedObjName}\",DELETE,ALL,Exist,Removed");
+
+                    sqlBuilder.AppendLine($"-- [WARNING] Point Removed: {deletedObjName} ({deletedId})");
+                    sqlBuilder.AppendLine($"DELETE FROM [dbo].[P_OBJECT] WHERE [DEVICE_SEQ] = {deviceSeq} AND [SYSTEM_PT_ID] = '{deletedId}';");
+                }
+
+                // 5. 파일 저장
+                if (hasChanges)
+                {
+                    File.WriteAllText(histPath, histBuilder.ToString(), new UTF8Encoding(true));
+                    File.WriteAllText(sqlPath, sqlBuilder.ToString(), new UTF8Encoding(true));
+                    _logger.Info($"[변경감지] {Path.GetFileName(histPath)} 생성 완료.");
+                }
+                else
+                {
+                    _logger.Info($"[변경없음] {deviceSeq}번 장비는 최신 상태입니다.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"히스토리 분석 실패 (Seq:{deviceSeq})", ex);
+            }
+        }
+
+        // =========================================================
+        // [추가] 인코딩 자동 판별 헬퍼 메서드
+        // =========================================================
+        private Encoding GetEncoding(string filename)
+        {
+            // 1. BOM(Byte Order Mark) 검사
+            var bom = new byte[4];
+            using (var file = new FileStream(filename, FileMode.Open, FileAccess.Read))
+            {
+                file.Read(bom, 0, 4);
+            }
+
+            // UTF-8 BOM (EF BB BF)
+            if (bom[0] == 0xef && bom[1] == 0xbb && bom[2] == 0xbf) return Encoding.UTF8;
+
+            // 그 외에는 한국어 윈도우 기본(CP949)로 간주
+            // (.NET Core/5+ 환경에서는 System.Text.Encoding.CodePages 패키지 필요할 수 있음)
+            // 여기서는 기본적으로 949 코드페이지를 시도합니다.
+            try
+            {
+                return Encoding.GetEncoding(949);
+            }
+            catch
+            {
+                // 만약 949를 지원하지 않는 환경이라면 Default 사용
+                return Encoding.Default;
+            }
+        }
+
     }
 }
