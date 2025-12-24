@@ -24,6 +24,13 @@ namespace BacnetInventoryScanner
         private Button btnExport;
         private Button btnCheckHistory;
 
+        // [추가] 각 설비별 Parent ID 상수 (전력용 ID는 확인 필요, 일단 임시값 넣음)
+        private const string PARENT_ID_FACILITY = "4311744512"; // 기계/공조
+        private const string PARENT_ID_POWER = "4311810304"; // 전력 (⚡확인필요!)
+
+        // ▼ [추가] 대역 선택용 콤보박스
+        private ComboBox cboSubnet;
+
         private DataGridView dataGridView1;
         private List<SiDeviceInfo> _siDevices = new List<SiDeviceInfo>();
         private List<(string Ip, uint DeviceId)> _unregisteredDevices = new List<(string Ip, uint DeviceId)>();
@@ -50,29 +57,53 @@ namespace BacnetInventoryScanner
             _logger.Info("--- 어플리케이션 시작 ---");
         }
 
+        // [MainForm.cs]
         private void InitDynamicControls()
         {
             this.BackColor = Color.FromArgb(242, 245, 248);
             Panel pnlHeader = new Panel { Dock = DockStyle.Top, Height = 80, Padding = new Padding(20) };
 
-            btnLoadDeviceList = CreateTossButton("장비 목록 로드", Color.FromArgb(0, 100, 255), 0);
-            btnStartScan = CreateTossButton("네트워크 스캔", Color.FromArgb(48, 199, 150), 170);
-            btnExport = CreateTossButton("SI 포인트 생성", Color.FromArgb(107, 118, 132), 340);
-            btnCheckHistory = CreateTossButton("변경 이력", Color.FromArgb(255, 140, 0), 510);
+            // 1. [추가] 대역 선택 콤보박스 생성
+            cboSubnet = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Font = new Font("맑은 고딕", 12, FontStyle.Bold),
+                Size = new Size(250, 45), // 너비 250
+                Location = new Point(20, 17)
+            };
 
-            // ⭐ [필수] 생성된 버튼에 클릭 이벤트 연결
-            
-            // ⭐ [필수] 클릭 이벤트 연결 (기존에 빠져있던 부분)
+            // 2. [추가] 스캔할 대역 목록 등록 (필요하면 더 추가하세요)
+            cboSubnet.Items.Add("172.16.130.x (자동제어_1캠퍼스)");
+            cboSubnet.Items.Add("172.16.132.x (자동제어_2캠퍼스)");
+            cboSubnet.Items.Add("192.168.134.x (전력망)");
+
+            // 기본값 선택 (0:기계, 1:공조, 2:전력)
+            cboSubnet.SelectedIndex = 2;
+
+            // 3. [수정] 버튼 위치 조정 (콤보박스 뒤로 밀기: X 좌표 +270씩 이동)
+            // 기존 0 -> 290
+            btnLoadDeviceList = CreateTossButton("장비 목록 로드", Color.FromArgb(0, 100, 255), 290);
+            // 기존 170 -> 460
+            btnStartScan = CreateTossButton("네트워크 스캔", Color.FromArgb(48, 199, 150), 460);
+            // 기존 340 -> 630
+            btnExport = CreateTossButton("SI 포인트 생성", Color.FromArgb(107, 118, 132), 630);
+            // 기존 510 -> 800
+            btnCheckHistory = CreateTossButton("변경 이력", Color.FromArgb(255, 140, 0), 800);
+
+            // 이벤트 연결 (기존 유지)
             btnLoadDeviceList.Click += btnLoadDeviceList_Click;
-            btnStartScan.Click += btnStartScan_Click; // 이 줄이 있어야 버튼이 동작합니다.
-            btnExport.Click += btnExport_Click; // 이 줄이 빠져있을 확률이 높습니다.
-            btnCheckHistory.Click += btnCheckHistory_Click
-                ;
+            btnStartScan.Click += btnStartScan_Click;
+            btnExport.Click += btnExport_Click;
+            btnCheckHistory.Click += btnCheckHistory_Click;
+
+            // 패널에 컨트롤 추가
+            pnlHeader.Controls.Add(cboSubnet); // 콤보박스 추가
             pnlHeader.Controls.Add(btnExport);
             pnlHeader.Controls.Add(btnStartScan);
             pnlHeader.Controls.Add(btnLoadDeviceList);
             pnlHeader.Controls.Add(btnCheckHistory);
 
+            // 그리드 설정 (기존 유지)
             dataGridView1 = new DataGridView
             {
                 Dock = DockStyle.Fill,
@@ -83,7 +114,6 @@ namespace BacnetInventoryScanner
                 AllowUserToAddRows = false,
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect
             };
-
             this.Controls.Add(dataGridView1);
             this.Controls.Add(pnlHeader);
         }
@@ -164,23 +194,53 @@ namespace BacnetInventoryScanner
         }
 
         // DB 로드 로직
+        // [MainForm.cs]
         private void btnLoadDeviceList_Click(object sender, EventArgs e)
         {
             try
             {
-                // 실제 배포 시에는 PasswordDecryptor를 사용하여 복호화된 PW를 넣으세요.
-                string connStr = "Server=192.168.131.127;Database=IBSInfo;User Id=sa;Password=admin123!@#;";
+                // 1. 현재 선택된 대역 확인
+                // 0:기계(172..130), 1:공조(172..132), 2:전력(192..134)
+                int selectedIndex = cboSubnet.SelectedIndex;
 
+                string targetParentId = "";
+                string targetIpPrefix = "";
+
+                switch (selectedIndex)
+                {
+                    case 0: // 기계
+                        targetParentId = PARENT_ID_FACILITY;
+                        targetIpPrefix = "172.16.130";
+                        break;
+                    case 1: // 공조
+                        targetParentId = PARENT_ID_FACILITY; // 공조도 설비에 속하면 동일 ID 사용
+                        targetIpPrefix = "172.16.132";
+                        break;
+                    case 2: // 전력
+                        targetParentId = PARENT_ID_POWER;    // ⭐ 전력용 ID 적용
+                        targetIpPrefix = "192.168.134";
+                        break;
+                    default:
+                        targetParentId = PARENT_ID_FACILITY;
+                        break;
+                }
+
+                string connStr = "Server=192.168.131.127;Database=IBSInfo;User Id=sa;Password=admin123!@#;";
                 using (SqlConnection conn = new SqlConnection(connStr))
                 {
                     conn.Open();
-                    // 사용자가 주신 MULTI_PARENT_ID 조건 적용
-                    string sql = "SELECT FIX_CODENO, DEVICE_ID, CODE_NAME, DEVICE_IP FROM P_OBJ_CODE WHERE MULTI_PARENT_ID = '4311744512'";
+
+                    // ⭐ [수정] 동적 Parent ID 적용
+                    string sql = $"SELECT FIX_CODENO, DEVICE_ID, CODE_NAME, DEVICE_IP FROM P_OBJ_CODE WHERE MULTI_PARENT_ID = '{targetParentId}'";
+
+                    // 만약 IP 대역으로도 DB를 필터링하고 싶다면 아래 주석 해제
+                    // sql += $" AND DEVICE_IP LIKE '{targetIpPrefix}%'";
 
                     SqlCommand cmd = new SqlCommand(sql, conn);
                     SqlDataReader reader = cmd.ExecuteReader();
 
-                    _siDevices.Clear();
+                    _siDevices.Clear(); // 기존 리스트 초기화
+
                     while (reader.Read())
                     {
                         _siDevices.Add(new SiDeviceInfo
@@ -188,13 +248,14 @@ namespace BacnetInventoryScanner
                             FixCodeNo = reader["FIX_CODENO"].ToString(),
                             DeviceId = Convert.ToInt32(reader["DEVICE_ID"]),
                             CodeName = reader["CODE_NAME"].ToString(),
-                            DeviceIp = reader["DEVICE_IP"].ToString()
+                            DeviceIp = reader["DEVICE_IP"].ToString(),
+                            IsOnline = false // 로드 시점엔 오프라인으로 가정
                         });
                     }
 
-                    dataGridView1.DataSource = null;
-                    dataGridView1.DataSource = _siDevices;
-                    MessageBox.Show($"{_siDevices.Count}개의 장비를 불러왔습니다.");
+                    // 그리드 갱신
+                    RefreshGrid();
+                    MessageBox.Show($"[{cboSubnet.Text}] DB 목록 로드 완료.\n총 {_siDevices.Count}대");
                 }
             }
             catch (Exception ex)
@@ -203,54 +264,130 @@ namespace BacnetInventoryScanner
             }
         }
 
+        // 그리드 갱신용 헬퍼 함수
+        private void RefreshGrid()
+        {
+            // 화면 깜빡임 방지
+            dataGridView1.DataSource = null;
+            // 리스트를 복사해서 바인딩 (UI 스레드 안전성)
+            dataGridView1.DataSource = new List<SiDeviceInfo>(_siDevices);
+
+            // 컬럼 정리 (보기 좋게)
+            if (dataGridView1.Columns["MultiParentId"] != null) dataGridView1.Columns["MultiParentId"].Visible = false;
+        }
+
         // MainForm.cs 내부의 스캔 버튼 이벤트
         // MainForm.cs 내부 수정
+        // [MainForm.cs]
+        // [MainForm.cs]
+        // ▼ [수정] 2. 스캔 버튼 로직 (이름 구분 처리)
         private async void btnStartScan_Click(object sender, EventArgs e)
         {
             if (_isScanning) return;
+
+            string selectedText = cboSubnet.SelectedItem.ToString();
+            string subnetPrefix = selectedText.Split('x')[0].Trim().TrimEnd('.');
+
             _isScanning = true;
-            btnStartScan.Text = "고속 스캔 중...";
+            btnStartScan.Text = $"스캔 중 ({subnetPrefix})...";
 
             try
             {
-                var registeredIps = new HashSet<string>(_siDevices.Select(d => d.DeviceIp));
-                var newDevicesBag = new System.Collections.Concurrent.ConcurrentBag<(string Ip, uint DeviceId)>();
-
-                foreach (var d in _siDevices) d.IsOnline = false;
+                // 초기화: 온라인 상태 리셋, 실제 이름 리셋
+                foreach (var d in _siDevices)
+                {
+                    d.IsOnline = false;
+                    d.RealDeviceName = ""; // 스캔 전엔 모름
+                }
 
                 await Task.Run(() => {
-                    var ipList = Enumerable.Range(1, 254).Select(i => $"172.16.130.{i}").ToList();
+                    var ipList = Enumerable.Range(1, 254).Select(i => $"{subnetPrefix}.{i}").ToList();
 
-                    // [속도 최적화] 병렬 처리 수준을 50으로 상향
                     Parallel.ForEach(ipList, new ParallelOptions { MaxDegreeOfParallelism = 50 }, (ip) => {
-                        // DirectScanDevice 내부 타임아웃이 짧아야 속도가 납니다.
+
                         var res = _inventoryService.DirectScanDevice(ip).Result;
 
-                        if (res.DeviceId != 0xFFFFFFFF)
+                        if (res.DeviceId != 0xFFFFFFFF) // 장비 발견
                         {
                             var info = _inventoryService.GetDeviceInfo(res.Ip, res.DeviceId).Result;
-                            string vName = info["Vendor"];
 
-                            if (registeredIps.Contains(ip))
+                            // ⭐ 실제 장비 이름 (없으면 Unknown)
+                            string realName = info["DeviceName"];
+                            string vendor = info["Vendor"];
+
+                            lock (_siDevices)
                             {
-                                var device = _siDevices.FirstOrDefault(d => d.DeviceIp == ip);
-                                if (device != null) device.IsOnline = true;
-                                _logger.Info($"[Online] {ip} (ID:{res.DeviceId}) | {info["Model"]} | {info["DeviceName"]}");
-                            }
-                            else if (vName.IndexOf("Tridium", StringComparison.OrdinalIgnoreCase) >= 0)
-                            {
-                                newDevicesBag.Add(res);
-                                _logger.Warning($"[New] {ip} 발견 (Tridium)");
+                                var existDevice = _siDevices.FirstOrDefault(d => d.DeviceIp == ip);
+
+                                if (existDevice != null)
+                                {
+                                    // [A] DB 매칭 성공 (기존 장비)
+                                    existDevice.IsOnline = true;
+                                    existDevice.RealDeviceName = realName; // ⭐ 실제 이름 업데이트
+
+                                    // 로그: [매칭] IP | ID | DB명 vs 실제명
+                                    _logger.Info($"[매칭] {ip} (ID:{res.DeviceId}) | DB:{existDevice.CodeName} | Real:{realName}");
+                                }
+                                else
+                                {
+                                    // [B] 신규 장비 (DB 없음)
+                                    _siDevices.Add(new SiDeviceInfo
+                                    {
+                                        FixCodeNo = "NEW",
+                                        DeviceId = (int)res.DeviceId,
+                                        DeviceIp = ip,
+
+                                        // ⭐ 명확한 구분
+                                        CodeName = "(DB미등록)",   // DB 이름은 없음
+                                        RealDeviceName = realName, // 실제 이름만 존재
+
+                                        IsOnline = true,
+                                        MultiParentId = "UNKNOWN"
+                                    });
+
+                                    _logger.Warning($"[신규] {ip} (ID:{res.DeviceId}) | Real:{realName} | Vendor:{vendor}");
+                                }
                             }
                         }
                     });
                 });
 
-                this.Invoke(new Action(() => { dataGridView1.Refresh(); }));
-                _unregisteredDevices = newDevicesBag.ToList();
-                MessageBox.Show("고속 스캔 완료");
+                this.Invoke(new Action(() => {
+                    RefreshGrid();
+
+                    // 보기 좋게 정렬 (IP 순서)
+                    var sorted = _siDevices.OrderBy(d =>
+                    {
+                        Version v;
+                        return Version.TryParse(d.DeviceIp, out v) ? v : new Version("0.0.0.0");
+                    }).ToList();
+
+                    dataGridView1.DataSource = sorted;
+
+                    // ⭐ [UI] 컬럼 순서 및 헤더 정리 (보기 좋게)
+                    if (dataGridView1.Columns["CodeName"] != null)
+                        dataGridView1.Columns["CodeName"].HeaderText = "DB 명칭";
+
+                    if (dataGridView1.Columns["RealDeviceName"] != null)
+                    {
+                        dataGridView1.Columns["RealDeviceName"].HeaderText = "실제 장비명 (Scan)";
+                        dataGridView1.Columns["RealDeviceName"].DisplayIndex = 3; // IP 뒤쪽으로 이동
+                    }
+
+                }));
+
+                MessageBox.Show($"스캔 완료.\n목록: {_siDevices.Count}대 (Online: {_siDevices.Count(d => d.IsOnline)})");
             }
-            finally { _isScanning = false; btnStartScan.Text = "네트워크 스캔"; }
+            catch (Exception ex)
+            {
+                _logger.Error("스캔 오류", ex);
+                MessageBox.Show("오류: " + ex.Message);
+            }
+            finally
+            {
+                _isScanning = false;
+                btnStartScan.Text = "네트워크 스캔";
+            }
         }
 
         private async void btnExport_Click(object sender, EventArgs e)
