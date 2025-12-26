@@ -270,11 +270,13 @@ namespace BacnetInventoryScanner.Service
         /// <summary>
         /// [추가] 특정 IP로 Who-Is 패킷을 보내 장비의 존재 여부와 ID를 확인합니다.
         /// </summary>
+        // [BacnetInventoryService.cs]
+
         public async Task<(string Ip, uint DeviceId)> DirectScanDevice(string ip)
         {
-            uint foundId = 0xFFFFFFFF; // 기본값: 찾지 못함
+            uint foundId = 0xFFFFFFFF; // 기본값: 찾지 못함 (UInt32.MaxValue)
 
-            // 포트 0은 OS가 할당하는 임의의 포트를 의미합니다.
+            // 포트 0: OS가 할당하는 임의의 남는 포트 사용 (포트 충돌 방지)
             using (var client = new BacnetClient(new BacnetIpUdpProtocolTransport(0, false)))
             {
                 try
@@ -282,87 +284,80 @@ namespace BacnetInventoryScanner.Service
                     client.Start();
                     var addr = new BacnetAddress(BacnetAddressTypes.IP, ip + ":47808");
 
-                    // I-Am 응답이 오면 ID를 기록합니다.
+                    // I-Am 응답 핸들러
                     client.OnIam += (c, adr, device_id, max_apdu, segmentation, vendor_id) => {
+                        // 응답 온 IP가 내가 찌른 IP인지 확인
                         if (adr.ToString().Contains(ip)) foundId = device_id;
                     };
 
-                    client.WhoIs(0, -1, addr); // 유니캐스트 Who-Is 송신
+                    // 유니캐스트 Who-Is 전송
+                    client.WhoIs(0, -1, addr);
 
-                    // 응답 대기 (최대 0.8초)
+                    // ⭐ [수정] 대기 시간 최적화 (총 300ms 대기)
+                    // 기존: 100ms * 8회 = 800ms (너무 김)
+                    // 변경: 50ms * 6회 = 300ms (0.3초)
+                    // 이유: 없는 장비는 0.3초 만에 빠르게 포기하고 다음으로 넘어가야 함
                     int wait = 0;
-                    while (foundId == 0xFFFFFFFF && wait < 8)
+                    while (foundId == 0xFFFFFFFF && wait < 6)
                     {
-                        await Task.Delay(100);
+                        await Task.Delay(50); // 50ms 단위로 짧게 체크
                         wait++;
                     }
                 }
-                catch { /* 스캔 중 통신 에러는 무시하고 다음 IP로 진행 */ }
+                catch
+                {
+                    // 통신 에러 발생 시(방화벽, 네트워크 단절 등) 즉시 무시하고 리턴
+                }
             }
+
+            // 찾았으면 ID 반환, 못 찾았으면 0xFFFFFFFF 반환
             return (ip, foundId);
         }
-        // [최종] UTF-8 인코딩 및 메모리 DTO 기반 병합 로직
+
+
         /// <summary>
-        /// [최종] deviceSeq가 일치하는 마스터 파일 내에서 SYSTEM_PT_ID 중복 체크 후 증분 추가 (UTF-8)
+        /// [델타 추출] DB 설정값(Server, System, DeviceId)을 그대로 유지하며 신규 포인트 생성
         /// </summary>
-        public void MergeToSiMaster(string filePath, List<Dictionary<string, object>> scannedPoints, int deviceId, int deviceSeq)
-        {
-            // [보완] 파일이 없으면 여기서도 중단 (MainForm에서 체크하지만 2중 안전장치)
-            if (!File.Exists(filePath))
-            {
-                _logger.Warning($"[중단] 마스터 파일 없음: {Path.GetFileName(filePath)}");
-                return;
-            }
+        // [BacnetInventoryService.cs]
 
-            try
-            {
-                HashSet<string> existingPtIds = new HashSet<string>();
-
-                // UTF-8로 기존 포인트 ID 수집
-                var lines = File.ReadAllLines(filePath, Encoding.UTF8);
-                foreach (var line in lines.Skip(1))
-                {
-                    var cols = line.Split(',');
-                    if (cols.Length > 5 && cols[4].Trim() == deviceSeq.ToString())
-                    {
-                        existingPtIds.Add(cols[5].Trim());
-                    }
-                }
-
-                // 중복 제외 신규 포인트 선별
-                var newPoints = scannedPoints.Where(p => !existingPtIds.Contains(p["SYSTEM_PT_ID"].ToString())).ToList();
-                if (newPoints.Count == 0) return;
-
-                StringBuilder sb = new StringBuilder();
-                foreach (var pt in newPoints)
-                {
-                    int type = Convert.ToInt32(pt["OBJ_TYPE"]);
-                    var row = new List<string> {
-                "1", "0", deviceId.ToString(), type.ToString(), deviceSeq.ToString(), pt["SYSTEM_PT_ID"].ToString(),
-                $"\"{pt["OBJ_NAME"]}\"", pt.ContainsKey("OBJ_UNIT") ? $"\"{pt["OBJ_UNIT"]}\"" : "", pt["OBJ_DECIMAL"].ToString(), "0", "False", $"\"{pt["OBJ_DESC"]}\""
-            };
-                    for (int s = 1; s <= 10; s++) row.Add(pt.ContainsKey($"OBJ_STATUS{s}") ? $"\"{pt[$"OBJ_STATUS{s}"]}\"" : "");
-                    row.AddRange(new[] { "0", "0", (type <= 2 ? "100000" : "1"), (type <= 2 ? "-100000" : "-1"), "False", "", "/0", "", "False", "", "", "", "254", "False", "" });
-
-                    sb.AppendLine(string.Join(",", row));
-                }
-
-                // 기존 파일 끝에 UTF-8로 추가
-                File.AppendAllText(filePath, sb.ToString(), Encoding.UTF8);
-                _logger.Info($"[병합성공] {Path.GetFileName(filePath)}: +{newPoints.Count}건");
-            }
-            catch (Exception ex) { _logger.Error($"병합 실패 (Seq:{deviceSeq})", ex); }
-        }
-        // [최종] 콤마 방지 + UTF-8 BOM + 순수 델타 파일 생성 로직
-        public void ExportDeltaOnly(string masterFilePath, List<Dictionary<string, object>> scannedPoints, int deviceId, int deviceSeq)
+        public void ExportDeltaOnly(
+            string masterFilePath,
+            List<Dictionary<string, object>> scannedPoints,
+            int serverId,
+            int systemCode,
+            int dbDeviceId,
+            string fixCodeNo,
+            int bacnetId
+            )
         {
             try
             {
+                // 사용할 설정값 변수 (기본값: DB에서 가져온 값)
+                int targetServerId = serverId;
+                int targetSystemId = systemCode;
+                int targetDeviceId = dbDeviceId;
+
                 HashSet<string> existingIds = new HashSet<string>();
+
+                // 1. 마스터 파일이 있으면 -> 설정값 읽어오기 (상속)
                 if (File.Exists(masterFilePath))
                 {
-                    // 한글 깨짐 방지를 위해 BOM 대응 UTF-8로 읽기
-                    var lines = File.ReadAllLines(masterFilePath, Encoding.UTF8);
+                    var lines = File.ReadAllLines(masterFilePath, GetEncoding(masterFilePath));
+
+                    // 데이터가 있는 경우(헤더 제외 최소 1줄 이상)
+                    if (lines.Length > 1)
+                    {
+                        var firstRow = lines[1].Split(','); // 첫 번째 데이터 행 파싱
+                        if (firstRow.Length >= 3)
+                        {
+                            // ⭐ [핵심] 마스터 파일의 설정값을 우선 적용 (기존 데이터와 통일)
+                            int.TryParse(firstRow[0], out targetServerId); // SERVER_ID
+                            int.TryParse(firstRow[1], out targetSystemId); // SYSTEM_ID
+                            int.TryParse(firstRow[2], out targetDeviceId); // DEVICE_ID
+                        }
+                    }
+
+                    // 중복 체크용 ID 수집
                     foreach (var line in lines.Skip(1))
                     {
                         var cols = line.Split(',');
@@ -370,14 +365,16 @@ namespace BacnetInventoryScanner.Service
                     }
                 }
 
+                // 2. 신규 포인트(Delta)만 필터링
                 var delta = scannedPoints.Where(p => !existingIds.Contains(p["SYSTEM_PT_ID"].ToString())).ToList();
                 if (delta.Count == 0) return;
 
                 string outDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "SI_DELTA_ONLY");
                 if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
-                string outPath = Path.Combine(outDir, $"Add-S-{deviceSeq}-{deviceId}.csv");
 
-                // ⭐ [중요] UTF-8 with BOM 설정 (new UTF8Encoding(true))
+                string outPath = Path.Combine(outDir, $"Add-S-{fixCodeNo}-{bacnetId}.csv");
+
+                // 3. CSV 쓰기
                 using (var sw = new StreamWriter(outPath, false, new UTF8Encoding(true)))
                 {
                     sw.WriteLine("SERVER_ID,SYSTEM_ID,DEVICE_ID,OBJ_TYPE,DEVICE_SEQ,SYSTEM_PT_ID,OBJ_NAME,OBJ_UNIT_NUM,OBJ_DECIMAL,OBJ_NUMBER,ROUND_YN,OBJ_DESC,OBJ_STATUS1,OBJ_STATUS2,OBJ_STATUS3,OBJ_STATUS4,OBJ_STATUS5,OBJ_STATUS6,OBJ_STATUS7,OBJ_STATUS8,OBJ_STATUS9,OBJ_STATUS10,ALARM_LV,DEADBAND,OBJ_ABOVE,OBJ_BELOW,OBJ_IMPORTANCE,OBJ_TREND_CYCLE,OBJ_ALARM_PAGE,OBJ_ALARM_MSG,OBJ_FMS,FMS_NAME,FMS_START_DATA,FMS_UPDATA_CYCLE,OBJ_SECURITY,OBJ_PDA,OBJ_NOTE");
@@ -386,24 +383,34 @@ namespace BacnetInventoryScanner.Service
                     {
                         int type = Convert.ToInt32(pt["OBJ_TYPE"]);
 
-                        // ⭐ [해결] 모든 콤마(,)를 제거하여 37개 컬럼 규격 강제 준수
+                        // ⭐ targetSystemId 등을 사용하여 기존 파일과 ID 통일
                         var row = new List<string> {
-                    "1", "0", deviceId.ToString(), type.ToString(), deviceSeq.ToString(),
+                    targetServerId.ToString(),  // SERVER_ID (파일 값)
+                    targetSystemId.ToString(),  // SYSTEM_ID (파일 값)
+                    targetDeviceId.ToString(),  // DEVICE_ID (파일 값)
+                    type.ToString(),
+                    fixCodeNo,
+
                     Clean(pt["SYSTEM_PT_ID"]),
                     Clean(pt["OBJ_NAME"]),
                     pt.ContainsKey("OBJ_UNIT") ? Clean(pt["OBJ_UNIT"]) : "",
-                    pt["OBJ_DECIMAL"].ToString(), "0", "False",
-                    Clean(pt["OBJ_DESC"]) // "C,D ZONE"이 "C D ZONE"으로 변경됨
+                    pt["OBJ_DECIMAL"].ToString(),
+                    "0", "False",
+                    Clean(pt["OBJ_DESC"])
                 };
+
                         for (int s = 1; s <= 10; s++) row.Add("");
                         row.AddRange(new[] { "0", "0", (type <= 2 ? "100000" : "1"), (type <= 2 ? "-100000" : "-1"), "False", "", "/0", "", "False", "", "", "", "254", "False", "" });
 
                         sw.WriteLine(string.Join(",", row));
                     }
                 }
-                _logger.Info($"[델타생성성공] {Path.GetFileName(outPath)}");
+                _logger.Info($"[델타생성] {Path.GetFileName(outPath)} (+{delta.Count}건, SystemID:{targetSystemId})");
             }
-            catch (Exception ex) { _logger.Error("CSV 생성 실패", ex); }
+            catch (Exception ex)
+            {
+                _logger.Error("CSV 생성 실패", ex);
+            }
         }
 
         // ⭐ [해결] 데이터 내의 콤마(,)를 제거하고 따옴표를 정제하는 함수
@@ -417,11 +424,20 @@ namespace BacnetInventoryScanner.Service
             s = s.Replace("\r", "").Replace("\n", "").Replace("\"", "");
             return s;
         }
-        // [기능] 마스터 파일과 현재 스캔 데이터를 비교하여 변경점(Update/Delete)을 찾고 P_OBJECT용 SQL 생성
-        // [기존 메서드 수정] DetectChangesAndGenerateSql
-        // [기능] 마스터 파일과 스캔 데이터를 비교하여 변경점(Update/Delete) 찾기
-        // [수정] 히스토리 CSV에 'OBJ_NAME' 컬럼을 추가하여 식별 용이성 강화
-        public void DetectChangesAndGenerateSql(string masterFilePath, List<Dictionary<string, object>> scannedPoints, int deviceId, int deviceSeq)
+
+        // [BacnetInventoryService.cs]
+
+        /// <summary>
+        /// [변경 감지 및 SQL 생성]
+        /// - Master 파일과 현재 스캔 데이터를 비교하여 Update/Delete 내역 추출
+        /// - FIX_CODENO를 기준으로 SQL 생성 (안전성 강화)
+        /// - 변경 전 값을 주석(-- Previous)으로 남겨 쿼리 실행 시 검증 가능
+        /// </summary>
+        /// <param name="masterFilePath">비교할 마스터 CSV 파일 경로</param>
+        /// <param name="scannedPoints">현장에서 스캔된 최신 포인트 리스트</param>
+        /// <param name="bacnetId">실제 통신용 BACnet Instance ID</param>
+        /// <param name="fixCodeNo">SI 관리용 고유 코드 (DB Key)</param>
+        public void DetectChangesAndGenerateSql(string masterFilePath, List<Dictionary<string, object>> scannedPoints, int bacnetId, string fixCodeNo)
         {
             try
             {
@@ -435,7 +451,7 @@ namespace BacnetInventoryScanner.Service
 
                 var headers = lines[0].Split(',');
 
-                // 컬럼 인덱스 매핑
+                // 컬럼 인덱스 매핑 (마스터 파일 구조에 맞게 동적 탐색)
                 int idxId = Array.IndexOf(headers, "SYSTEM_PT_ID");
                 int idxName = Array.IndexOf(headers, "OBJ_NAME");
                 int idxUnit = Array.IndexOf(headers, "OBJ_UNIT_NUM");
@@ -451,6 +467,7 @@ namespace BacnetInventoryScanner.Service
                     var cols = line.Split(',');
                     if (cols.Length > idxId && idxId >= 0)
                     {
+                        // 따옴표 제거 후 Key 저장
                         string ptId = cols[idxId].Trim().Replace("\"", "");
                         masterMap[ptId] = cols;
                     }
@@ -460,19 +477,20 @@ namespace BacnetInventoryScanner.Service
                 string histDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "HISTORY");
                 if (!Directory.Exists(histDir)) Directory.CreateDirectory(histDir);
 
+                // 파일명 생성: History_S-{FixCodeNo}-{BacnetId}_{Date}.csv
                 string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmm");
-                string histPath = Path.Combine(histDir, $"History_S-{deviceSeq}-{deviceId}_{timestamp}.csv");
-                string sqlPath = Path.Combine(histDir, $"Query_S-{deviceSeq}-{deviceId}_{timestamp}.sql");
+                string histPath = Path.Combine(histDir, $"History_S-{fixCodeNo}-{bacnetId}_{timestamp}.csv");
+                string sqlPath = Path.Combine(histDir, $"Query_S-{fixCodeNo}-{bacnetId}_{timestamp}.sql");
 
                 StringBuilder sqlBuilder = new StringBuilder();
                 StringBuilder histBuilder = new StringBuilder();
 
-                // ⭐ [수정] 헤더에 OBJ_NAME 추가
+                // 히스토리 CSV 헤더 (식별용 OBJ_NAME 포함)
                 histBuilder.AppendLine("TIMESTAMP,DEVICE_SEQ,SYSTEM_PT_ID,OBJ_NAME,ACTION,COLUMN,OLD_VALUE,NEW_VALUE");
 
                 bool hasChanges = false;
 
-                // 3. [Update 감지]
+                // 3. [Update 감지] 스캔된 포인트를 순회하며 마스터와 비교
                 foreach (var scanPt in scannedPoints)
                 {
                     string ptId = scanPt["SYSTEM_PT_ID"].ToString();
@@ -480,10 +498,10 @@ namespace BacnetInventoryScanner.Service
                     if (masterMap.ContainsKey(ptId))
                     {
                         var masterCols = masterMap[ptId];
-
-                        // ⭐ 참조용 현재 이름 가져오기 (식별용)
+                        // 식별용 현재 이름 (로그 남길 때 어떤 포인트인지 사람이 알아보기 위함)
                         string currentObjName = scanPt.ContainsKey("OBJ_NAME") ? Clean(scanPt["OBJ_NAME"]) : "";
 
+                        // 비교 대상 컬럼 정의
                         var targets = new List<(int Idx, string Key, string ColName)>
                 {
                     (idxName, "OBJ_NAME", "OBJ_NAME"),
@@ -495,9 +513,9 @@ namespace BacnetInventoryScanner.Service
 
                         foreach (var t in targets)
                         {
-                            if (t.Idx < 0) continue;
+                            if (t.Idx < 0) continue; // 해당 컬럼이 마스터 파일에 없으면 패스
 
-                            // Clean() 적용하여 비교 (공백/따옴표 제거된 순수 값)
+                            // Clean() 함수로 공백/따옴표/특수문자 정제 후 비교
                             string oldVal = Clean(masterCols[t.Idx]);
                             string newVal = scanPt.ContainsKey(t.Key) ? Clean(scanPt[t.Key]) : "";
 
@@ -505,49 +523,54 @@ namespace BacnetInventoryScanner.Service
                             {
                                 hasChanges = true;
 
-                                // ⭐ [수정] 히스토리에 식별용 이름(currentObjName) 함께 기록
-                                histBuilder.AppendLine($"{DateTime.Now},{deviceSeq},{ptId},\"{currentObjName}\",UPDATE,{t.ColName},\"{oldVal}\",\"{newVal}\"");
+                                // [CSV 기록] 변경 이력 저장
+                                histBuilder.AppendLine($"{DateTime.Now},{fixCodeNo},{ptId},\"{currentObjName}\",UPDATE,{t.ColName},\"{oldVal}\",\"{newVal}\"");
 
-                                // SQL 생성
+                                // [SQL 생성] 안전한 쿼리 생성 (이스케이프 처리)
                                 string safeVal = newVal.Replace("'", "''");
-                                sqlBuilder.AppendLine($"UPDATE [dbo].[P_OBJECT] SET [{t.ColName}] = '{safeVal}' WHERE [DEVICE_SEQ] = {deviceSeq} AND [SYSTEM_PT_ID] = '{ptId}';");
+
+                                // ⭐ [핵심] WHERE 조건에 FIX_CODENO 사용 + 주석으로 이전 값 표시
+                                sqlBuilder.AppendLine($"UPDATE [dbo].[P_OBJECT] SET [{t.ColName}] = '{safeVal}' WHERE [DEVICE_SEQ] = '{fixCodeNo}' AND [SYSTEM_PT_ID] = '{ptId}'; -- Previous: '{oldVal}'");
                             }
                         }
+                        // 비교가 끝난 포인트는 맵에서 제거 (나중에 남은 건 Delete 처리)
                         masterMap.Remove(ptId);
                     }
                 }
 
-                // 4. [Delete 감지]
+                // 4. [Delete 감지] 마스터에는 있는데 스캔에서 사라진 포인트
                 foreach (var kvp in masterMap)
                 {
                     string deletedId = kvp.Key;
                     string[] deletedCols = kvp.Value;
 
-                    // ⭐ 삭제된 포인트의 이름 가져오기 (마스터 파일 기준)
                     string deletedObjName = (idxName >= 0 && deletedCols.Length > idxName) ? Clean(deletedCols[idxName]) : "Unknown";
 
                     hasChanges = true;
-                    histBuilder.AppendLine($"{DateTime.Now},{deviceSeq},{deletedId},\"{deletedObjName}\",DELETE,ALL,Exist,Removed");
+                    // [CSV] 삭제 이력
+                    histBuilder.AppendLine($"{DateTime.Now},{fixCodeNo},{deletedId},\"{deletedObjName}\",DELETE,ALL,Exist,Removed");
 
+                    // [SQL] 삭제 쿼리 (위험하므로 주석 경고 추가)
                     sqlBuilder.AppendLine($"-- [WARNING] Point Removed: {deletedObjName} ({deletedId})");
-                    sqlBuilder.AppendLine($"DELETE FROM [dbo].[P_OBJECT] WHERE [DEVICE_SEQ] = {deviceSeq} AND [SYSTEM_PT_ID] = '{deletedId}';");
+                    sqlBuilder.AppendLine($"DELETE FROM [dbo].[P_OBJECT] WHERE [DEVICE_SEQ] = '{fixCodeNo}' AND [SYSTEM_PT_ID] = '{deletedId}';");
                 }
 
-                // 5. 파일 저장
+                // 5. 파일 저장 (변경사항이 있을 때만)
                 if (hasChanges)
                 {
+                    // UTF-8 BOM으로 저장 (엑셀 한글 깨짐 방지)
                     File.WriteAllText(histPath, histBuilder.ToString(), new UTF8Encoding(true));
                     File.WriteAllText(sqlPath, sqlBuilder.ToString(), new UTF8Encoding(true));
                     _logger.Info($"[변경감지] {Path.GetFileName(histPath)} 생성 완료.");
                 }
                 else
                 {
-                    _logger.Info($"[변경없음] {deviceSeq}번 장비는 최신 상태입니다.");
+                    _logger.Info($"[변경없음] {fixCodeNo} (ID:{bacnetId})는 최신 상태입니다.");
                 }
             }
             catch (Exception ex)
             {
-                _logger.Error($"히스토리 분석 실패 (Seq:{deviceSeq})", ex);
+                _logger.Error($"히스토리 분석 실패 (Key:{fixCodeNo})", ex);
             }
         }
 
@@ -579,6 +602,131 @@ namespace BacnetInventoryScanner.Service
                 return Encoding.Default;
             }
         }
+        // [BacnetInventoryService.cs]
 
+        /// <summary>
+        /// [통합] 오늘 생성된 개별 히스토리 파일들을 하나로 병합합니다. (Total_History_YYYYMMDD.csv)
+        /// </summary>
+        public string MergeTodayHistoryFiles()
+        {
+            try
+            {
+                string histDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "HISTORY");
+                if (!Directory.Exists(histDir)) return null;
+
+                // 1. 오늘 날짜로 생성된 파일만 검색 (예: History_S-*_20251226_*.csv)
+                string today = DateTime.Now.ToString("yyyyMMdd");
+                string[] files = Directory.GetFiles(histDir, $"History_*_{today}_*.csv");
+
+                if (files.Length == 0) return null;
+
+                // 2. 통합 파일명 생성
+                string summaryPath = Path.Combine(histDir, $"Total_History_{today}.csv");
+                StringBuilder sb = new StringBuilder();
+
+                // 3. 헤더 추가 (한 번만)
+                sb.AppendLine("TIMESTAMP,DEVICE_SEQ,SYSTEM_PT_ID,OBJ_NAME,ACTION,COLUMN,OLD_VALUE,NEW_VALUE");
+
+                int mergedCount = 0;
+
+                // 4. 파일 순회하며 내용 병합
+                foreach (string file in files)
+                {
+                    // 방금 만든 통합 파일(Total_History...)이 검색되면 건너뜀 (무한루프 방지)
+                    if (Path.GetFileName(file).StartsWith("Total_")) continue;
+
+                    // 내용 읽기 (UTF-8)
+                    var lines = File.ReadAllLines(file, Encoding.UTF8);
+
+                    // 헤더(첫 줄) 제외하고 나머지 줄 복사
+                    if (lines.Length > 1)
+                    {
+                        for (int i = 1; i < lines.Length; i++)
+                        {
+                            sb.AppendLine(lines[i]);
+                            mergedCount++;
+                        }
+                    }
+                }
+
+                if (mergedCount == 0) return null;
+
+                // 5. 통합 파일 저장 (UTF-8 BOM) - 엑셀 한글 깨짐 방지
+                File.WriteAllText(summaryPath, sb.ToString(), new UTF8Encoding(true));
+
+                _logger.Info($"[통합완료] {Path.GetFileName(summaryPath)} 생성됨 ({mergedCount}건)");
+                return summaryPath;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("히스토리 병합 실패", ex);
+                return null;
+            }
+        }
+        // [BacnetInventoryService.cs] 맨 아래에 추가
+
+        /// <summary>
+        /// [SQL 통합] 오늘 생성된 개별 SQL 파일들을 하나의 실행 스크립트로 병합합니다.
+        /// </summary>
+        public string MergeTodaySqlFiles()
+        {
+            try
+            {
+                string histDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "HISTORY");
+                if (!Directory.Exists(histDir)) return null;
+
+                string today = DateTime.Now.ToString("yyyyMMdd");
+                // 오늘 날짜의 Query_*.sql 파일 검색
+                string[] files = Directory.GetFiles(histDir, $"Query_*_{today}_*.sql");
+
+                if (files.Length == 0) return null;
+
+                string summaryPath = Path.Combine(histDir, $"Total_Query_{today}.sql");
+                StringBuilder sb = new StringBuilder();
+
+                // 1. SQL 헤더 작성 (DB 컨텍스트 지정 등)
+                sb.AppendLine($"-- [Total SQL Script] Generated at {DateTime.Now}");
+                sb.AppendLine($"-- 실행 전 DB 백업을 권장합니다.");
+                sb.AppendLine("USE [IBSInfo];"); // DB명 지정 (필요 시 수정)
+                sb.AppendLine("GO");
+                sb.AppendLine("");
+
+                int mergedCount = 0;
+
+                foreach (string file in files)
+                {
+                    // 통합 파일 본인은 제외
+                    if (Path.GetFileName(file).StartsWith("Total_")) continue;
+
+                    // 내용 읽기 (한글 깨짐 방지 UTF-8)
+                    string content = File.ReadAllText(file, Encoding.UTF8);
+
+                    // 빈 파일이 아니면 병합
+                    if (!string.IsNullOrWhiteSpace(content))
+                    {
+                        sb.AppendLine($"-- ===============================================");
+                        sb.AppendLine($"-- Source: {Path.GetFileName(file)}");
+                        sb.AppendLine($"-- ===============================================");
+                        sb.AppendLine(content);
+                        sb.AppendLine("GO"); // 배치 분리기 (SSMS 실행용)
+                        sb.AppendLine("");
+                        mergedCount++;
+                    }
+                }
+
+                if (mergedCount == 0) return null;
+
+                // 2. 통합 파일 저장 (UTF-8 BOM 필수 - SSMS에서 한글 주석 깨짐 방지)
+                File.WriteAllText(summaryPath, sb.ToString(), new UTF8Encoding(true));
+
+                _logger.Info($"[SQL통합완료] {Path.GetFileName(summaryPath)} ({mergedCount}건 병합)");
+                return summaryPath;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("SQL 병합 실패", ex);
+                return null;
+            }
+        }
     }
 }

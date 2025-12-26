@@ -118,11 +118,12 @@ namespace BacnetInventoryScanner
             this.Controls.Add(pnlHeader);
         }
 
-        // [이벤트 핸들러] 변경사항 추적 로직 실행
-        // [이벤트] '변경 이력' 버튼 클릭 시 실행됨
+
+        // [MainForm.cs]
+
         private async void btnCheckHistory_Click(object sender, EventArgs e)
         {
-            // 1. 온라인(통신 가능) 상태인 장비만 추려냄
+            // 1. 온라인 장비 필터링
             var onlineDevices = _siDevices.FindAll(d => d.IsOnline);
             if (onlineDevices.Count == 0)
             {
@@ -130,49 +131,67 @@ namespace BacnetInventoryScanner
                 return;
             }
 
-            // 2. UI 잠금 및 상태 표시
+            // 2. UI 잠금
             btnCheckHistory.Enabled = false;
             btnCheckHistory.Text = "분석 중...";
             _logger.Info("--- [Start] 변경 사항(History) 및 SQL 분석 시작 ---");
 
             try
             {
+                // 3. 비동기 병렬 분석 (CSV/SQL 개별 생성)
                 await Task.Run(async () => {
-                    // SI_MASTER 폴더 경로 확보
                     string masterDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "SI_MASTER");
-                    // 폴더 내 모든 CSV 파일을 미리 읽어둠 (성능 최적화)
+                    if (!Directory.Exists(masterDir)) Directory.CreateDirectory(masterDir);
                     var files = Directory.GetFiles(masterDir, "*.csv");
 
-                    foreach (var dev in onlineDevices)
-                    {
-                        // [로직] 파일명에 장비코드(FixCodeNo)가 포함된 마스터 파일을 찾음 (유연한 매핑)
+                    Parallel.ForEach(onlineDevices, new ParallelOptions { MaxDegreeOfParallelism = 10 }, (dev) => {
                         string masterFile = files.FirstOrDefault(f => Path.GetFileName(f).Contains(dev.FixCodeNo));
 
                         if (!string.IsNullOrEmpty(masterFile))
                         {
-                            // [통신] 장비에서 현재 포인트 리스트 수집
-                            var currentPoints = await _inventoryService.HarvestPoints(dev.DeviceIp);
-
-                            if (currentPoints != null)
+                            var currentPoints = _inventoryService.HarvestPoints(dev.DeviceIp).Result;
+                            if (currentPoints != null && currentPoints.Count > 0)
                             {
-                                // [핵심] 서비스 계층의 변경 감지 로직 호출 (Update/Delete/SQL 생성)
-                                _inventoryService.DetectChangesAndGenerateSql(masterFile, currentPoints, dev.DeviceId, int.Parse(dev.FixCodeNo));
+                                // 개별 파일 생성
+                                _inventoryService.DetectChangesAndGenerateSql(
+                                    masterFile, currentPoints, (int)dev.BacnetId, dev.FixCodeNo);
                             }
                         }
-                    }
+                    });
                 });
 
-                // 3. 완료 처리 및 폴더 열기
-                MessageBox.Show("분석 완료!\nExports\\HISTORY 폴더에 결과가 저장되었습니다.");
-                System.Diagnostics.Process.Start("explorer.exe", Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "HISTORY"));
+                // 4. [통합] CSV 리포트 병합
+                string summaryCsv = _inventoryService.MergeTodayHistoryFiles();
+
+                // 5. [통합] SQL 스크립트 병합 (추가됨)
+                string summarySql = _inventoryService.MergeTodaySqlFiles();
+
+                // 6. 결과 메시지 작성
+                StringBuilder msg = new StringBuilder();
+                msg.AppendLine("분석이 완료되었습니다.");
+
+                if (!string.IsNullOrEmpty(summaryCsv))
+                    msg.AppendLine($"- CSV 리포트: {Path.GetFileName(summaryCsv)}");
+
+                if (!string.IsNullOrEmpty(summarySql))
+                    msg.AppendLine($"- SQL 스크립트: {Path.GetFileName(summarySql)}");
+
+                MessageBox.Show(msg.ToString(), "완료");
+
+                // 탐색기 열기
+                string historyPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "HISTORY");
+                if (Directory.Exists(historyPath))
+                {
+                    System.Diagnostics.Process.Start("explorer.exe", historyPath);
+                }
             }
             catch (Exception ex)
             {
-                _logger.Error("히스토리 분석 중 치명적 오류 발생", ex);
+                _logger.Error("히스토리 분석 중 오류", ex);
+                MessageBox.Show("오류 발생: " + ex.Message);
             }
             finally
             {
-                // UI 복구
                 btnCheckHistory.Enabled = true;
                 btnCheckHistory.Text = "변경 이력";
             }
@@ -195,29 +214,29 @@ namespace BacnetInventoryScanner
 
         // DB 로드 로직
         // [MainForm.cs]
+        // [MainForm.cs]
+
         private void btnLoadDeviceList_Click(object sender, EventArgs e)
         {
             try
             {
-                // 1. 현재 선택된 대역 확인
-                // 0:기계(172..130), 1:공조(172..132), 2:전력(192..134)
+                // 1. [복구] 콤보박스 선택에 따라 Parent ID 결정 (설비 vs 전력)
                 int selectedIndex = cboSubnet.SelectedIndex;
-
                 string targetParentId = "";
-                string targetIpPrefix = "";
+                string targetIpPrefix = ""; // 필요시 사용 (현재는 ParentID가 핵심)
 
                 switch (selectedIndex)
                 {
-                    case 0: // 기계
-                        targetParentId = PARENT_ID_FACILITY;
+                    case 0: // 기계설비 (172.16.130.x)
+                        targetParentId = PARENT_ID_FACILITY; // "4311744512"
                         targetIpPrefix = "172.16.130";
                         break;
-                    case 1: // 공조
-                        targetParentId = PARENT_ID_FACILITY; // 공조도 설비에 속하면 동일 ID 사용
+                    case 1: // 공조설비 (172.16.132.x) - 보통 기계와 같은 ParentID 사용
+                        targetParentId = PARENT_ID_FACILITY;
                         targetIpPrefix = "172.16.132";
                         break;
-                    case 2: // 전력
-                        targetParentId = PARENT_ID_POWER;    // ⭐ 전력용 ID 적용
+                    case 2: // 전력 (192.168.134.x)
+                        targetParentId = PARENT_ID_POWER;    // "4311810304" (사용자님 확인 값)
                         targetIpPrefix = "192.168.134";
                         break;
                     default:
@@ -225,42 +244,60 @@ namespace BacnetInventoryScanner
                         break;
                 }
 
+                // 2. DB 연결 및 조회
                 string connStr = "Server=192.168.131.127;Database=IBSInfo;User Id=sa;Password=admin123!@#;";
                 using (SqlConnection conn = new SqlConnection(connStr))
                 {
                     conn.Open();
 
-                    // ⭐ [수정] 동적 Parent ID 적용
-                    string sql = $"SELECT FIX_CODENO, DEVICE_ID, CODE_NAME, DEVICE_IP FROM P_OBJ_CODE WHERE MULTI_PARENT_ID = '{targetParentId}'";
+                    // ⭐ [수정] SI 설정값(SERVER_ID, SYSTEM_CODE, DEVICE_ID)까지 모두 조회
+                    // DEVICE_ID는 여기서 '정렬 순서'를 의미하는 값입니다.
+                    string sql = $@"
+                SELECT FIX_CODENO, SERVER_ID, SYSTEM_CODE, DEVICE_ID, CODE_NAME, DEVICE_IP 
+                FROM P_OBJ_CODE 
+                WHERE MULTI_PARENT_ID = '{targetParentId}'";
 
-                    // 만약 IP 대역으로도 DB를 필터링하고 싶다면 아래 주석 해제
+                    // 필요하다면 IP 대역으로 한 번 더 필터링 (선택 사항)
                     // sql += $" AND DEVICE_IP LIKE '{targetIpPrefix}%'";
 
                     SqlCommand cmd = new SqlCommand(sql, conn);
                     SqlDataReader reader = cmd.ExecuteReader();
 
-                    _siDevices.Clear(); // 기존 리스트 초기화
+                    _siDevices.Clear(); // 리스트 초기화
 
                     while (reader.Read())
                     {
                         _siDevices.Add(new SiDeviceInfo
                         {
+                            // 1. [DB Key] 고유 관리 번호 (SEQ)
                             FixCodeNo = reader["FIX_CODENO"].ToString(),
-                            DeviceId = Convert.ToInt32(reader["DEVICE_ID"]),
+
+                            // 2. [SI Config] CSV 생성을 위한 설정값들 매핑
+                            ServerId = Convert.ToInt32(reader["SERVER_ID"]),
+                            SystemCode = Convert.ToInt32(reader["SYSTEM_CODE"]),
+                            DbDeviceId = Convert.ToInt32(reader["DEVICE_ID"]), // DB에 저장된 순서값
+
+                            // 3. [Protocol Key] 스캔 전에는 모름 (0으로 초기화)
+                            BacnetId = 0,
+
+                            // 4. 기타 정보
                             CodeName = reader["CODE_NAME"].ToString(),
                             DeviceIp = reader["DEVICE_IP"].ToString(),
-                            IsOnline = false // 로드 시점엔 오프라인으로 가정
+                            IsOnline = false
                         });
                     }
 
-                    // 그리드 갱신
+                    // UI 갱신
                     RefreshGrid();
-                    MessageBox.Show($"[{cboSubnet.Text}] DB 목록 로드 완료.\n총 {_siDevices.Count}대");
+
+                    // 결과 알림
+                    string categoryName = selectedIndex == 2 ? "전력" : "설비";
+                    MessageBox.Show($"[{categoryName}] DB 목록 로드 완료.\n총 {_siDevices.Count}대 (ParentID: {targetParentId})");
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show("DB 에러: " + ex.Message);
+                MessageBox.Show("DB 로드 에러: " + ex.Message);
             }
         }
 
@@ -281,10 +318,20 @@ namespace BacnetInventoryScanner
         // [MainForm.cs]
         // [MainForm.cs]
         // ▼ [수정] 2. 스캔 버튼 로직 (이름 구분 처리)
+        // [MainForm.cs]
+
         private async void btnStartScan_Click(object sender, EventArgs e)
         {
+            // 중복 실행 방지
             if (_isScanning) return;
 
+            if (cboSubnet.SelectedItem == null)
+            {
+                MessageBox.Show("스캔할 대역을 먼저 선택하세요.");
+                return;
+            }
+
+            // 1. 선택된 대역 파싱 (예: "192.168.134.x (전력)" -> "192.168.134")
             string selectedText = cboSubnet.SelectedItem.ToString();
             string subnetPrefix = selectedText.Split('x')[0].Trim().TrimEnd('.');
 
@@ -293,69 +340,90 @@ namespace BacnetInventoryScanner
 
             try
             {
-                // 초기화: 온라인 상태 리셋, 실제 이름 리셋
+                // 2. 스캔 시작 전 초기화 (기존 리스트의 상태 리셋)
                 foreach (var d in _siDevices)
                 {
                     d.IsOnline = false;
-                    d.RealDeviceName = ""; // 스캔 전엔 모름
+                    d.RealDeviceName = ""; // 스캔 전엔 실제 이름을 모름
                 }
 
                 await Task.Run(() => {
+                    // 1~254 IP 리스트 생성
                     var ipList = Enumerable.Range(1, 254).Select(i => $"{subnetPrefix}.{i}").ToList();
 
+                    // 3. 병렬 스캔 시작 (속도 향상)
                     Parallel.ForEach(ipList, new ParallelOptions { MaxDegreeOfParallelism = 50 }, (ip) => {
 
-                        var res = _inventoryService.DirectScanDevice(ip).Result;
-
-                        if (res.DeviceId != 0xFFFFFFFF) // 장비 발견
+                        // ⭐ [Try-Catch 추가] 개별 장비 에러가 전체 프로그램을 멈추지 않게 함 (System.pdb 에러 방지)
+                        try
                         {
-                            var info = _inventoryService.GetDeviceInfo(res.Ip, res.DeviceId).Result;
+                            // [통신] 장비 존재 여부 확인 (Who-Is)
+                            var res = _inventoryService.DirectScanDevice(ip).Result;
 
-                            // ⭐ 실제 장비 이름 (없으면 Unknown)
-                            string realName = info["DeviceName"];
-                            string vendor = info["Vendor"];
-
-                            lock (_siDevices)
+                            if (res.DeviceId != 0xFFFFFFFF) // 장비 발견!
                             {
-                                var existDevice = _siDevices.FirstOrDefault(d => d.DeviceIp == ip);
+                                // [통신] 상세 정보 조회 (이름, 벤더 등)
+                                var info = _inventoryService.GetDeviceInfo(res.Ip, res.DeviceId).Result;
 
-                                if (existDevice != null)
-                                {
-                                    // [A] DB 매칭 성공 (기존 장비)
-                                    existDevice.IsOnline = true;
-                                    existDevice.RealDeviceName = realName; // ⭐ 실제 이름 업데이트
+                                string realName = info.ContainsKey("DeviceName") ? info["DeviceName"] : "Unknown";
+                                string vendor = info.ContainsKey("Vendor") ? info["Vendor"] : "Unknown";
 
-                                    // 로그: [매칭] IP | ID | DB명 vs 실제명
-                                    _logger.Info($"[매칭] {ip} (ID:{res.DeviceId}) | DB:{existDevice.CodeName} | Real:{realName}");
-                                }
-                                else
+                                // 리스트 동기화 (Multi-thread 안전 장치)
+                                lock (_siDevices)
                                 {
-                                    // [B] 신규 장비 (DB 없음)
-                                    _siDevices.Add(new SiDeviceInfo
+                                    // IP 기준으로 기존(DB에 있는) 장비인지 확인
+                                    var existDevice = _siDevices.FirstOrDefault(d => d.DeviceIp == ip);
+
+                                    if (existDevice != null)
                                     {
-                                        FixCodeNo = "NEW",
-                                        DeviceId = (int)res.DeviceId,
-                                        DeviceIp = ip,
+                                        // [A] 매칭 성공 (기존 DB 장비)
+                                        // -> DB에서 가져온 ServerId, SystemCode, DbDeviceId 등은 그대로 유지됨
+                                        existDevice.IsOnline = true;
+                                        existDevice.RealDeviceName = realName;
 
-                                        // ⭐ 명확한 구분
-                                        CodeName = "(DB미등록)",   // DB 이름은 없음
-                                        RealDeviceName = realName, // 실제 이름만 존재
+                                        // ⭐ 실제 통신 ID 업데이트 (DB의 DEVICE_ID와 구별됨)
+                                        existDevice.BacnetId = res.DeviceId;
 
-                                        IsOnline = true,
-                                        MultiParentId = "UNKNOWN"
-                                    });
+                                        _logger.Info($"[매칭] {ip} | Key:{existDevice.FixCodeNo} | ID:{existDevice.BacnetId}");
+                                    }
+                                    else
+                                    {
+                                        // [B] 신규 장비 (DB 미등록)
+                                        // -> DB 정보가 없으므로 Export를 위해 '기본값'으로 초기화
+                                        _siDevices.Add(new SiDeviceInfo
+                                        {
+                                            FixCodeNo = "NEW",          // 관리번호 없음
+                                            BacnetId = res.DeviceId,    // 실제 통신 ID
 
-                                    _logger.Warning($"[신규] {ip} (ID:{res.DeviceId}) | Real:{realName} | Vendor:{vendor}");
+                                            // ⭐ [추가] 신규 장비 기본값 (나중에 CSV 만들 때 필요)
+                                            ServerId = 1,               // 기본 서버
+                                            SystemCode = 0,             // 기본 시스템
+                                            DbDeviceId = 0,             // 정렬 순서 (모름)
+
+                                            DeviceIp = ip,
+                                            CodeName = "(DB미등록)",
+                                            RealDeviceName = realName,
+                                            IsOnline = true
+                                        });
+
+                                        _logger.Warning($"[신규] {ip} (ID:{res.DeviceId}) | Real:{realName}");
+                                    }
                                 }
                             }
+                        }
+                        catch (Exception innerEx)
+                        {
+                            // 타임아웃 등 개별 장비 에러는 무시하고(로그만 남기고) 계속 진행
+                            // _logger.Debug($"Skip {ip}: {innerEx.Message}");
                         }
                     });
                 });
 
+                // 4. UI 갱신 (Invoke 필수)
                 this.Invoke(new Action(() => {
-                    RefreshGrid();
+                    RefreshGrid(); // 그리드 초기화
 
-                    // 보기 좋게 정렬 (IP 순서)
+                    // IP 순서대로 보기 좋게 정렬
                     var sorted = _siDevices.OrderBy(d =>
                     {
                         Version v;
@@ -364,23 +432,30 @@ namespace BacnetInventoryScanner
 
                     dataGridView1.DataSource = sorted;
 
-                    // ⭐ [UI] 컬럼 순서 및 헤더 정리 (보기 좋게)
-                    if (dataGridView1.Columns["CodeName"] != null)
-                        dataGridView1.Columns["CodeName"].HeaderText = "DB 명칭";
+                    // ⭐ [UI] 헤더 정리 (사용자 혼동 방지)
+                    if (dataGridView1.Columns["FixCodeNo"] != null)
+                        dataGridView1.Columns["FixCodeNo"].HeaderText = "DB Key (FIX_NO)";
+
+                    if (dataGridView1.Columns["BacnetId"] != null)
+                        dataGridView1.Columns["BacnetId"].HeaderText = "BACnet ID";
+
+                    if (dataGridView1.Columns["DbDeviceId"] != null)
+                        dataGridView1.Columns["DbDeviceId"].HeaderText = "정렬순서(ID)";
 
                     if (dataGridView1.Columns["RealDeviceName"] != null)
-                    {
                         dataGridView1.Columns["RealDeviceName"].HeaderText = "실제 장비명 (Scan)";
-                        dataGridView1.Columns["RealDeviceName"].DisplayIndex = 3; // IP 뒤쪽으로 이동
-                    }
+
+                    // 불필요한 내부 컬럼 숨기기 (선택 사항)
+                    if (dataGridView1.Columns["ServerId"] != null) dataGridView1.Columns["ServerId"].Visible = false;
+                    if (dataGridView1.Columns["SystemCode"] != null) dataGridView1.Columns["SystemCode"].Visible = false;
 
                 }));
 
-                MessageBox.Show($"스캔 완료.\n목록: {_siDevices.Count}대 (Online: {_siDevices.Count(d => d.IsOnline)})");
+                MessageBox.Show($"스캔 완료.\n총 목록: {_siDevices.Count}대 (Online: {_siDevices.Count(d => d.IsOnline)})");
             }
             catch (Exception ex)
             {
-                _logger.Error("스캔 오류", ex);
+                _logger.Error("스캔 프로세스 오류", ex);
                 MessageBox.Show("오류: " + ex.Message);
             }
             finally
@@ -390,12 +465,23 @@ namespace BacnetInventoryScanner
             }
         }
 
+        // [MainForm.cs]
+
+        // [MainForm.cs]
+
         private async void btnExport_Click(object sender, EventArgs e)
         {
+            // 1. 저장될 폴더 경로
             string masterPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "SI_MASTER");
+
+            // 2. 온라인 장비만 필터링
             var onlineDevices = _siDevices.FindAll(d => d.IsOnline);
 
-            if (onlineDevices.Count == 0) return;
+            if (onlineDevices.Count == 0)
+            {
+                MessageBox.Show("온라인 장비가 없습니다. 먼저 스캔을 수행하세요.");
+                return;
+            }
 
             btnExport.Enabled = false;
             btnExport.Text = "델타 추출 중...";
@@ -403,25 +489,53 @@ namespace BacnetInventoryScanner
             try
             {
                 await Task.Run(async () => {
+                    if (!Directory.Exists(masterPath)) Directory.CreateDirectory(masterPath);
                     var files = Directory.GetFiles(masterPath, "*.csv");
 
-                    foreach (var dev in onlineDevices)
-                    {
-                        // 유연한 파일 매핑 (Seq 포함 파일 찾기)
+                    // 병렬 처리
+                    Parallel.ForEach(onlineDevices, new ParallelOptions { MaxDegreeOfParallelism = 10 }, (dev) => {
+
+                        // 신규 장비("NEW")는 마스터 파일이 없으므로 건너뜀
+                        if (dev.FixCodeNo == "NEW") return;
+
+                        // 마스터 파일 찾기
                         string foundMaster = files.FirstOrDefault(f => Path.GetFileName(f).Contains(dev.FixCodeNo));
 
                         if (!string.IsNullOrEmpty(foundMaster))
                         {
-                            var points = await _inventoryService.HarvestPoints(dev.DeviceIp);
-                            if (points != null)
+                            // 포인트 수집
+                            var points = _inventoryService.HarvestPoints(dev.DeviceIp).Result;
+
+                            if (points != null && points.Count > 0)
                             {
-                                // [변경] 기존 파일에 붙이지 않고 '새로운 델타 전용 파일' 생성
-                                _inventoryService.ExportDeltaOnly(foundMaster, points, dev.DeviceId, int.Parse(dev.FixCodeNo));
+                                // ⭐ [수정] 서비스 메서드에 'DB 설정값' 전달
+                                _inventoryService.ExportDeltaOnly(
+                                    foundMaster,
+                                    points,
+                                    dev.ServerId,       // DB값: SERVER_ID
+                                    dev.SystemCode,     // DB값: SYSTEM_CODE
+                                    dev.DbDeviceId,     // DB값: DEVICE_ID (정렬순서)
+                                    dev.FixCodeNo,      // DB값: DEVICE_SEQ
+                                    (int)dev.BacnetId   // 통신값: BACnet ID (파일명 생성용)
+                                );
                             }
                         }
-                    }
+                    });
                 });
-                MessageBox.Show("신규 포인트(Delta) 추출이 완료되었습니다.\nSI_DELTA_ONLY 폴더를 확인하세요.");
+
+                MessageBox.Show("신규 포인트(Delta) 추출이 완료되었습니다.\nExports\\SI_DELTA_ONLY 폴더를 확인하세요.");
+
+                // 결과 폴더 열기
+                string deltaDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Exports", "SI_DELTA_ONLY");
+                if (Directory.Exists(deltaDir))
+                {
+                    System.Diagnostics.Process.Start("explorer.exe", deltaDir);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Export 중 오류 발생", ex);
+                MessageBox.Show("오류: " + ex.Message);
             }
             finally
             {

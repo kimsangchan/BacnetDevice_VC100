@@ -1,20 +1,22 @@
-﻿// Models\SiDeviceInfo.cs
-using System;
+﻿// [Models\SiDeviceInfo.cs]
 
 namespace BacnetInventoryScanner.Models
 {
     public class SiDeviceInfo
     {
-        public string FixCodeNo { get; set; }      // FIX_CODENO
-        public int DeviceId { get; set; }           // DEVICE_ID
-        // ⭐ [구분] DB에 저장된 관리 명칭
-        public string CodeName { get; set; }
+        // --- 기존 필드 ---
+        public string FixCodeNo { get; set; }       // DB Key (P_OBJ_CODE.FIX_CODENO)
+        public uint BacnetId { get; set; }          // 통신 ID (스캔값)
 
-        // ⭐ [추가] 실제 현장 장비에서 스캔된 명칭 (BACnet Object Name)
+        // --- ⭐ [추가] CSV 생성을 위한 DB 정보 ---
+        public int ServerId { get; set; }           // P_OBJ_CODE.SERVER_ID
+        public int SystemCode { get; set; }         // P_OBJ_CODE.SYSTEM_CODE (CSV의 SYSTEM_ID 매핑)
+        public int DbDeviceId { get; set; }         // P_OBJ_CODE.DEVICE_ID (화면 출력 순서)
+
+        // --- 기타 필드 ---
+        public string CodeName { get; set; }
         public string RealDeviceName { get; set; }
-        public string DeviceIp { get; set; }        // DEVICE_IP
-        public int DevicePort { get; set; }         // DEVICE_PORT
-        public string MultiParentId { get; set; }   // 4311744512
-        public bool IsOnline { get; set; }          // 스캔 결과 (현장에서 응답 오는지)
+        public string DeviceIp { get; set; }
+        public bool IsOnline { get; set; }
     }
 }

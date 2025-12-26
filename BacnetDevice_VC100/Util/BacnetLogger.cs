@@ -70,35 +70,43 @@ namespace BacnetDevice_VC100.Util
         ///   device_10068\
         ///     device_10068_20251218.txt
         /// </summary>
+        // [BacnetDevice_VC100\Util\BacnetLogger.cs]
+
         private string GetLogFilePath()
         {
             try
             {
-                // 실행 파일 경로
+                // 1. 기본 Logs 폴더
                 string exePath = AppDomain.CurrentDomain.BaseDirectory;
-
-                // Logs 폴더
                 string logsFolder = Path.Combine(exePath, "Logs");
 
-                // device_[seq] 폴더
-                string deviceFolder = Path.Combine(logsFolder, $"device_{_deviceSeq}");
+                // 2. [수정] '날짜' 폴더 생성 (예: Logs\2025-12-26)
+                // 장비별 폴더가 아니라, 날짜별로 모으는 것이 관리하기 훨씬 편합니다.
+                string todayDate = DateTime.Now.ToString("yyyy-MM-dd");
+                string dateFolder = Path.Combine(logsFolder, todayDate);
 
-                // 폴더가 없으면 생성
-                if (!Directory.Exists(deviceFolder))
+                if (!Directory.Exists(dateFolder))
                 {
-                    Directory.CreateDirectory(deviceFolder);
+                    Directory.CreateDirectory(dateFolder);
                 }
 
-                // 파일명: device_20059_20251218.txt
-                string fileName = $"device_{_deviceSeq}_{DateTime.Now:yyyyMMdd}.txt";
+                // 3. [수정] 파일명 생성 (예: Device_1010.txt)
+                // 이미 폴더가 날짜이므로 파일명에는 날짜를 뺄 수도 있지만, 
+                // 파일을 밖으로 복사해 나갈 때를 대비해 파일명에도 날짜를 넣는 것이 좋습니다.
+                string fileName = $"Device_{_deviceSeq}_{DateTime.Now:yyyyMMdd}.txt";
 
-                return Path.Combine(deviceFolder, fileName);
+                // 만약 '메인 시스템 로그(99999)'라면 이름을 구분해줍니다.
+                if (_deviceSeq == 99999)
+                {
+                    fileName = $"System_Scan_{DateTime.Now:yyyyMMdd}.txt";
+                }
+
+                return Path.Combine(dateFolder, fileName);
             }
             catch
             {
                 // 실패 시 임시 폴더 사용
-                string tempPath = Path.GetTempPath();
-                return Path.Combine(tempPath, $"BacnetDevice_{_deviceSeq}_{DateTime.Now:yyyyMMdd}.txt");
+                return Path.Combine(Path.GetTempPath(), $"Error_{DateTime.Now:yyyyMMdd}.txt");
             }
         }
 
